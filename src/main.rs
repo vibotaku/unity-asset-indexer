@@ -384,8 +384,16 @@ fn cmd_config(
         cfg.add_library(l)?;
     }
     for l in &remove_library {
+        let root = uai::config::expand_tilde(l).to_string_lossy().to_string();
         if !cfg.remove_library(l)? {
             eprintln!("note: {l} was not in the library list");
+        }
+        if cfg.server.is_none() {
+            let svc = LocalService::open(&cfg)?;
+            let n = svc.db.delete_packages_by_root(&root)?;
+            if n > 0 {
+                eprintln!("removed {n} package(s) indexed under {root} from the index");
+            }
         }
     }
     if let Some(s) = set_server {

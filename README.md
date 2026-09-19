@@ -54,7 +54,7 @@ not mounted right now is skipped (its packages stay in the index) instead of fai
 
 ```bash
 uai config --add-library ~/UnityPacks            # append a root
-uai config --remove-library ~/UnityPacks
+uai config --remove-library ~/UnityPacks         # also drops that root's packages from the index
 uai --library /mnt/a --library /mnt/b index      # or per call; UAI_LIBRARY takes a path list (: or ;)
 uai packages                                     # shows @root when more than one root is indexed
 ```

@@ -280,6 +280,17 @@ impl Database {
             .optional()?)
     }
 
+    /// Drop every package (and its assets) indexed under `root`. Returns how many were removed.
+    pub fn delete_packages_by_root(&self, root: &str) -> Result<usize> {
+        let mut st = self.conn.prepare("SELECT id FROM packages WHERE root=?1")?;
+        let ids: Vec<i64> = st.query_map(params![root], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        drop(st);
+        for id in &ids {
+            self.delete_package(*id)?;
+        }
+        Ok(ids.len())
+    }
+
     pub fn asset_count(&self, pid: i64) -> Result<i64> {
         Ok(self.conn.query_row("SELECT COUNT(*) FROM assets WHERE package_id=?1", params![pid], |r| r.get(0))?)
     }
