@@ -25,6 +25,9 @@ pub struct ConfigFile {
     pub libraries: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<String>,
+    /// Where `uai cache add` extracts packages (default: `<home>/cache`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_dir: Option<String>,
 }
 
 impl ConfigFile {
@@ -45,6 +48,8 @@ pub struct Config {
     pub home: PathBuf,
     /// Base URL of a remote `uai serve` instance. When set, read-only commands run against it.
     pub server: Option<String>,
+    /// Extracted-package cache location; `None` means `<home>/cache`.
+    pub cache_dir: Option<PathBuf>,
 }
 
 impl Config {
@@ -55,7 +60,7 @@ impl Config {
         self.home.join("previews.db")
     }
     pub fn cache_dir(&self) -> PathBuf {
-        self.home.join("cache")
+        self.cache_dir.clone().unwrap_or_else(|| self.home.join("cache"))
     }
     pub fn config_file(&self) -> PathBuf {
         self.home.join("config.json")
@@ -86,7 +91,12 @@ impl Config {
     }
 
     /// Resolve settings. `libraries`, `home` and `server` are explicit overrides (flags).
-    pub fn load(libraries: &[String], home: Option<&str>, server: Option<&str>) -> Result<Config> {
+    pub fn load(
+        libraries: &[String],
+        home: Option<&str>,
+        server: Option<&str>,
+        cache_dir: Option<&str>,
+    ) -> Result<Config> {
         let home_dir = home
             .map(|s| s.to_string())
             .or_else(|| std::env::var("UAI_HOME").ok().filter(|s| !s.is_empty()))
@@ -116,13 +126,19 @@ impl Config {
             .or_else(|| data.server.clone())
             .filter(|s| !s.trim().is_empty())
             .map(|s| s.trim().trim_end_matches('/').to_string());
+        let cache_dir = cache_dir
+            .map(|s| s.to_string())
+            .or_else(|| std::env::var("UAI_CACHE_DIR").ok())
+            .or_else(|| data.cache_dir.clone())
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| expand_tilde(s.trim()));
         if !cfg_file.exists() {
             let _ = Self::write_file(
                 &cfg_file,
-                &ConfigFile { library: None, libraries: Some(roots.clone()), server: None },
+                &ConfigFile { library: None, libraries: Some(roots.clone()), server: None, cache_dir: None },
             );
         }
-        Ok(Config { libraries: roots.iter().map(|s| expand_tilde(s)).collect(), home: home_dir, server })
+        Ok(Config { libraries: roots.iter().map(|s| expand_tilde(s)).collect(), home: home_dir, server, cache_dir })
     }
 
     fn save_roots(&mut self, roots: Vec<String>) -> Result<()> {
@@ -155,6 +171,14 @@ impl Config {
             self.libraries.iter().map(|p| p.to_string_lossy().to_string()).filter(|r| !same_root(r, &target)).collect();
         self.save_roots(roots)?;
         Ok(self.libraries.len() != before)
+    }
+
+    pub fn save_cache_dir(&mut self, dir: Option<&str>) -> Result<()> {
+        let mut data = Self::read_file(&self.config_file());
+        data.cache_dir = dir.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        Self::write_file(&self.config_file(), &data)?;
+        self.cache_dir = data.cache_dir.as_deref().map(expand_tilde);
+        Ok(())
     }
 
     pub fn save_server(&mut self, server: Option<&str>) -> Result<()> {

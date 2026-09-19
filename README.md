@@ -79,6 +79,8 @@ uai cat Chest.mat                             # print a text asset (YAML / C# / 
 uai preview chest.prefab -o chest.png         # thumbnail
 uai rdeps dungeon_texture.png                 # reverse dependencies
 uai cache add "Ultimate Sound FX"             # keep a package fully extracted locally for instant exports
+uai cache add --all --min-mb 1000             # or every package above a size; --workers N in parallel
+uai config --set-cache-dir /Volumes/T5/cache  # put the cache on a big/fast disk ($UAI_CACHE_DIR, --cache-dir)
 ```
 
 Assets can be named by guid, `Package::Assets/full/path`, an `Assets/...` path, a path suffix, a bare

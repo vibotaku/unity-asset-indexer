@@ -180,7 +180,7 @@ fn fixture() -> Fixture {
     );
     let home = root.join("home");
     fs::create_dir_all(&home).unwrap();
-    let cfg = Config { libraries: vec![lib.clone()], home, server: None };
+    let cfg = Config { libraries: vec![lib.clone()], home, server: None, cache_dir: None };
     let mut db = Database::open_with_previews(&cfg.db_path(), &cfg.previews_path()).unwrap();
     let opts = IndexOptions { workers: 1, ..Default::default() };
     let mut log = |_: &str| {};
@@ -472,6 +472,7 @@ fn multiple_library_roots() {
         libraries: vec![f.lib.clone(), lib2.clone(), f.root.join("missing")],
         home: f.cfg.home.clone(),
         server: None,
+        cache_dir: None,
     };
     let mut db = Database::open_with_previews(&cfg.db_path(), &cfg.previews_path()).unwrap();
     let mut log = |_: &str| {};
@@ -490,7 +491,12 @@ fn multiple_library_roots() {
     assert!(res.result.missing_in_package.is_empty());
     assert!(out.join("Assets/Sounds/hit.wav.meta").is_file());
     // Indexing with only the first root reachable keeps lib2's package (its root is not mounted).
-    let cfg1 = Config { libraries: vec![f.lib.clone(), f.root.join("gone")], home: f.cfg.home.clone(), server: None };
+    let cfg1 = Config {
+        libraries: vec![f.lib.clone(), f.root.join("gone")],
+        home: f.cfg.home.clone(),
+        server: None,
+        cache_dir: None,
+    };
     let rep =
         index_library(&cfg1, &mut db, &IndexOptions { workers: 1, ..Default::default() }, &mut log, None).unwrap();
     assert_eq!(rep.removed, 0);

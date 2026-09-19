@@ -36,6 +36,9 @@ struct Cli {
     /// Ignore any configured server and use the local index
     #[arg(long, global = true)]
     local: bool,
+    /// Extracted-package cache dir (default: config / $UAI_CACHE_DIR / <home>/cache)
+    #[arg(long, global = true)]
+    cache_dir: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -66,6 +69,12 @@ enum Cmd {
         /// Forget the configured server
         #[arg(long)]
         clear_server: bool,
+        /// Persist where `uai cache add` extracts packages
+        #[arg(long = "set-cache-dir", value_name = "DIR", conflicts_with = "clear_cache_dir")]
+        set_cache_dir: Option<String>,
+        /// Go back to the default cache dir (<home>/cache)
+        #[arg(long)]
+        clear_cache_dir: bool,
         #[command(flatten)]
         json: JsonFlag,
     },
@@ -232,6 +241,15 @@ enum Cmd {
         #[arg(value_parser = ["add", "rm", "ls"])]
         action: String,
         package: Option<String>,
+        /// add/rm: every indexed package instead of one
+        #[arg(long)]
+        all: bool,
+        /// add --all: only packages at least this many MB (compressed)
+        #[arg(long, value_name = "MB")]
+        min_mb: Option<u64>,
+        /// add --all: packages extracted in parallel
+        #[arg(long, default_value_t = 3)]
+        workers: usize,
         #[command(flatten)]
         json: JsonFlag,
     },
@@ -273,12 +291,27 @@ fn main() {
 }
 
 fn run(cli: Cli) -> Result<()> {
-    let mut cfg = Config::load(&cli.library, cli.home.as_deref(), cli.server.as_deref())?;
+    let mut cfg = Config::load(&cli.library, cli.home.as_deref(), cli.server.as_deref(), cli.cache_dir.as_deref())?;
     if cli.local {
         cfg.server = None;
     }
     match cli.cmd {
-        Cmd::Config { set_library, add_library, remove_library, set_server, clear_server, json } => {
+        Cmd::Config {
+            set_library,
+            add_library,
+            remove_library,
+            set_server,
+            clear_server,
+            set_cache_dir,
+            clear_cache_dir,
+            json,
+        } => {
+            if let Some(d) = set_cache_dir {
+                cfg.save_cache_dir(Some(&d))?;
+            }
+            if clear_cache_dir {
+                cfg.save_cache_dir(None)?;
+            }
             cmd_config(cfg, set_library, add_library, remove_library, set_server, clear_server, json.json)
         }
         Cmd::Index { workers, force, only, no_previews, json } => {
@@ -360,7 +393,9 @@ fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Cache { action, package, json } => cmd_cache(&cfg, &action, package.as_deref(), json.json),
+        Cmd::Cache { action, package, all, min_mb, workers, json } => {
+            cmd_cache(&cfg, &action, package.as_deref(), all, min_mb, workers, json.json)
+        }
         Cmd::Serve { bind, open } => uai::server::serve(cfg, &bind, open),
         Cmd::Mcp => uai::mcp::run(cfg),
     }
@@ -884,7 +919,80 @@ fn cmd_preview(svc: &dyn Service, ident: &str, package: Option<&str>, out: Optio
     Ok(())
 }
 
-fn cmd_cache(cfg: &Config, action: &str, package: Option<&str>, json: bool) -> Result<()> {
+/// `cache add --all` / `cache rm --all`: every package, `workers` extractions at a time.
+fn cmd_cache_all(cfg: &Config, action: &str, pkgs: Vec<Package>, workers: usize, json: bool) -> Result<()> {
+    use std::sync::{Arc, Mutex};
+    if action == "rm" {
+        let mut n = 0;
+        for p in &pkgs {
+            if uai::exporter::cache_remove(cfg, p.id)? {
+                n += 1;
+            }
+        }
+        if json {
+            return out_json(&serde_json::json!({ "removed": n }));
+        }
+        println!("removed {n} cached package(s)");
+        return Ok(());
+    }
+    // Largest first so the long tail does not serialize on one worker.
+    let mut pkgs = pkgs;
+    pkgs.sort_by_key(|p| std::cmp::Reverse(p.size));
+    let total = pkgs.len();
+    let queue = Arc::new(Mutex::new(std::collections::VecDeque::from(pkgs)));
+    type Outcome = (String, std::result::Result<(), String>);
+    let results: Arc<Mutex<Vec<Outcome>>> = Arc::new(Mutex::new(Vec::new()));
+    let t0 = std::time::Instant::now();
+    std::thread::scope(|s| {
+        for _ in 0..workers.max(1) {
+            let queue = Arc::clone(&queue);
+            let results = Arc::clone(&results);
+            s.spawn(move || loop {
+                let Some(p) = queue.lock().unwrap().pop_front() else { break };
+                let already = uai::exporter::cache_complete(cfg, p.id);
+                let mut log = |_: &str| {};
+                let r = uai::exporter::cache_add(cfg, &p, &mut log).map(|_| ()).map_err(|e| format!("{e:#}"));
+                let mut res = results.lock().unwrap();
+                res.push((p.name.clone(), r.clone()));
+                if !json {
+                    match r {
+                        Ok(()) if already => println!("[{}/{total}] {} (already cached)", res.len(), p.name),
+                        Ok(()) => println!("[{}/{total}] {} ({})", res.len(), p.name, human(p.size)),
+                        Err(e) => println!("[{}/{total}] ERROR {}: {e}", res.len(), p.name),
+                    }
+                }
+            });
+        }
+    });
+    let results = results.lock().unwrap();
+    let errors: Vec<_> = results.iter().filter(|(_, r)| r.is_err()).collect();
+    if json {
+        return out_json(&serde_json::json!({
+            "cached": results.len() - errors.len(),
+            "errors": errors.iter().map(|(n, r)| serde_json::json!({"package": n, "error": r.clone().unwrap_err()})).collect::<Vec<_>>(),
+            "seconds": t0.elapsed().as_secs_f64(),
+            "cache_dir": cfg.cache_dir().to_string_lossy(),
+        }));
+    }
+    println!(
+        "done: {} cached, {} errors, in {:.0}s -> {}",
+        results.len() - errors.len(),
+        errors.len(),
+        t0.elapsed().as_secs_f64(),
+        cfg.cache_dir().display()
+    );
+    Ok(())
+}
+
+fn cmd_cache(
+    cfg: &Config,
+    action: &str,
+    package: Option<&str>,
+    all: bool,
+    min_mb: Option<u64>,
+    workers: usize,
+    json: bool,
+) -> Result<()> {
     if cfg.server.is_some() {
         bail!("the cache lives on the machine with the library; drop --server (or use --local)");
     }
@@ -908,7 +1016,12 @@ fn cmd_cache(cfg: &Config, action: &str, package: Option<&str>, json: bool) -> R
         }
         return Ok(());
     }
-    let Some(package) = package else { bail!("package required") };
+    if all {
+        let min = min_mb.unwrap_or(0) as i64 * 1_000_000;
+        let pkgs: Vec<_> = svc.packages()?.into_iter().filter(|p| p.status == "ok" && p.size >= min).collect();
+        return cmd_cache_all(&svc.cfg, action, pkgs, workers, json);
+    }
+    let Some(package) = package else { bail!("package required (or --all)") };
     let pkg = svc.find_package(package)?;
     match action {
         "add" => {
