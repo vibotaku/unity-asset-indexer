@@ -1,0 +1,105 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-latest,   target: aarch64-apple-darwin,       archive: tar.gz }
+          - { os: macos-13,       target: x86_64-apple-darwin,        archive: tar.gz }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc,     archive: zip }
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu,   archive: tar.gz }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, archive: tar.gz }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: package (unix)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          NAME="uai-${VERSION}-${{ matrix.target }}"
+          mkdir -p "dist/$NAME"
+          cp "target/${{ matrix.target }}/release/uai" README.md LICENSE "dist/$NAME/"
+          cp -r skills "dist/$NAME/"
+          tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
+          (cd dist && shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256")
+      - name: package (windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $Version = $env:GITHUB_REF_NAME -replace '^v',''
+          $Name = "uai-$Version-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path "dist/$Name" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/uai.exe","README.md","LICENSE" "dist/$Name/"
+          Copy-Item -Recurse skills "dist/$Name/skills"
+          Compress-Archive -Path "dist/$Name" -DestinationPath "dist/$Name.zip"
+          (Get-FileHash "dist/$Name.zip" -Algorithm SHA256).Hash.ToLower() + "  $Name.zip" | Out-File -Encoding ascii "dist/$Name.zip.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          {
+            echo "## uai $VERSION"
+            echo
+            echo "Single static binary, no runtime dependencies. Download the archive for your platform, unpack, and put \`uai\` on your PATH."
+            echo
+            echo "| Platform | File |"
+            echo "|---|---|"
+            echo "| macOS Apple Silicon | uai-$VERSION-aarch64-apple-darwin.tar.gz |"
+            echo "| macOS Intel | uai-$VERSION-x86_64-apple-darwin.tar.gz |"
+            echo "| Windows x64 | uai-$VERSION-x86_64-pc-windows-msvc.zip |"
+            echo "| Linux x64 | uai-$VERSION-x86_64-unknown-linux-gnu.tar.gz |"
+            echo "| Linux arm64 | uai-$VERSION-aarch64-unknown-linux-gnu.tar.gz |"
+            echo
+            echo "**macOS:** the binary is not notarized. If Gatekeeper blocks it, run \`xattr -d com.apple.quarantine uai\` once."
+            echo
+            echo "SHA-256 checksums are in the \`.sha256\` files."
+          } > notes.md
+      - uses: softprops/action-gh-release@v2
+        with:
+          body_path: notes.md
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256

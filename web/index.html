@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Unity Asset Index</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232b6cb0'/%3E%3Cpath d='M16 6l9 5v10l-9 5-9-5V11z' fill='none' stroke='white' stroke-width='2.4' stroke-linejoin='round'/%3E%3Cpath d='M7 11l9 5 9-5M16 16v10' fill='none' stroke='white' stroke-width='2.4'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand" title="Unity Asset Index">
+    <svg viewBox="0 0 32 32" width="26" height="26" aria-hidden="true"><rect width="32" height="32" rx="7" fill="var(--accent)"/><path d="M16 6l9 5v10l-9 5-9-5V11z" fill="none" stroke="#fff" stroke-width="2.4" stroke-linejoin="round"/><path d="M7 11l9 5 9-5M16 16v10" fill="none" stroke="#fff" stroke-width="2.4"/></svg>
+    <span>uai</span>
+  </div>
+  <form id="searchForm" class="search" role="search" autocomplete="off">
+    <input id="q" type="search" placeholder="Search assets… e.g. chest prefab, sm env tree, sword swing" aria-label="Search assets">
+    <button type="submit" class="primary">Search</button>
+  </form>
+  <div class="top-right">
+    <span id="stats" class="stats" aria-live="polite"></span>
+    <button id="basketBtn" class="ghost" type="button" title="Export basket">Basket <span id="basketCount" class="pill">0</span></button>
+  </div>
+</header>
+
+<div class="filters" id="filters">
+  <div class="chips" id="kindChips" aria-label="Kinds"></div>
+  <select id="packageSel" aria-label="Package"><option value="">All packages</option></select>
+  <select id="publisherSel" aria-label="Publisher"><option value="">All publishers</option></select>
+  <input id="ext" type="text" placeholder="ext (fbx…)" aria-label="Extension" size="8">
+  <button id="clearFilters" class="ghost" type="button">Clear</button>
+</div>
+
+<main class="layout">
+  <aside class="side" id="side">
+    <div class="side-head">
+      <h2>Packages</h2>
+      <input id="pkgFilter" type="search" placeholder="filter…" aria-label="Filter packages">
+    </div>
+    <ul id="pkgList" class="pkg-list"></ul>
+  </aside>
+
+  <section class="results" id="results">
+    <div class="results-head">
+      <h1 id="resultsTitle">Browse</h1>
+      <div class="view-toggle" role="group" aria-label="View">
+        <button id="viewGrid" class="ghost active" type="button" title="Grid">▦</button>
+        <button id="viewList" class="ghost" type="button" title="List">☰</button>
+      </div>
+    </div>
+    <div id="pkgBrowser" class="pkg-browser hidden"></div>
+    <div id="grid" class="grid"></div>
+    <div class="more-row"><button id="more" class="ghost hidden" type="button">Load more</button><span id="empty" class="muted hidden">No matches.</span></div>
+  </section>
+
+  <aside class="detail hidden" id="detail" aria-live="polite"></aside>
+</main>
+
+<div id="basket" class="basket hidden" role="dialog" aria-label="Export basket">
+  <div class="basket-head">
+    <h2>Export basket</h2>
+    <button id="basketClose" class="ghost" type="button" aria-label="Close">✕</button>
+  </div>
+  <ul id="basketList" class="basket-list"></ul>
+  <div class="basket-opts">
+    <label><input type="checkbox" id="optDeps" checked> include dependencies</label>
+    <label><input type="checkbox" id="optScripts" checked> include scripts</label>
+    <label><input type="checkbox" id="optFolders" checked> folder .meta files</label>
+  </div>
+  <div class="basket-actions">
+    <button id="planBtn" class="ghost" type="button">Preview plan</button>
+    <button id="downloadBtn" class="primary" type="button">Download .unitypackage</button>
+    <button id="basketClear" class="ghost" type="button">Clear</button>
+  </div>
+  <div id="planOut" class="plan-out"></div>
+</div>
+
+<div id="toast" class="toast hidden" role="status"></div>
+<script src="app.js"></script>
+</body>
+</html>

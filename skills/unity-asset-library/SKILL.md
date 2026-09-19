@@ -5,26 +5,29 @@ description: Find and pull individual assets (prefabs, models, textures, materia
 
 # Unity asset library (`uai`)
 
-The team's purchased Unity packages live on an SMB share and are indexed by the `uai` tool
-(repo: `~/repo/UnityAssetIndexer`, binary: `~/repo/UnityAssetIndexer/.venv/bin/uai`). It can search
-every asset inside every `.unitypackage`, compute the full dependency closure, and write just those
-files into a project's `Assets/` folder with `.meta` files, so guid references stay valid.
+The team's purchased Unity packages live on an SMB share and are indexed by `uai`
+(https://github.com/vibotaku/unity-asset-indexer, a single native binary). It can search every asset
+inside every `.unitypackage`, compute the full dependency closure, and write just those files into a
+project's `Assets/` folder with `.meta` files, so guid references stay valid.
 
-`uai` is usually not on PATH. Call it by full path, or define a shell alias once per session:
+`uai` is normally on PATH. If not, look for `~/.cargo/bin/uai` or ask the user to install it from
+the GitHub releases. Add `--json` to any command for machine-readable output.
 
-```bash
-alias uai=~/repo/UnityAssetIndexer/.venv/bin/uai
-```
+Two ways to run it:
 
-Add `--json` to any command for machine-readable output.
+* **Local**: the share is mounted and an index exists (`uai config` shows `library_mounted true`).
+* **Remote**: a teammate runs `uai serve`; use `uai --server http://host:7878 ...` (or
+  `uai config --set-server URL` once, or `UAI_SERVER`). Everything below works the same, exports are
+  streamed from the server. No share, no index needed on this machine.
 
 ## Workflow
 
 1. **Check the index is available**
    ```bash
-   uai config          # library_mounted must be True; if not, ask the user to mount smb://fs01.corp.volatilebytes.com/Shared
+   uai config          # library_mounted must be true, or server must be set; packages > 0
    ```
-   If `packages` is 0, run `uai index` (first run is several minutes; later runs are incremental).
+   If neither works: ask the user to mount `smb://fs01.corp.volatilebytes.com/Shared` and run
+   `uai index`, or for the server URL. Do not guess paths.
 
 2. **Find candidates**
    ```bash
@@ -63,14 +66,18 @@ Add `--json` to any command for machine-readable output.
 
 ## Identifiers
 
-`uai` accepts a 32-hex guid, `Package::Assets/full/path`, an `Assets/...` path, a path suffix, or a bare
-file name. If a name is ambiguous the command exits with the candidate list; pick the guid.
+`uai` accepts a 32-hex guid, `Package::Assets/full/path`, an `Assets/...` path, a path suffix, a bare
+file name, or `#<id>` from `--json` output. If a name is ambiguous the command exits with the
+candidate list; pick the guid.
 
 ## Gotchas
 
 * Exports from very large packages (multi-GB audio bundles) re-stream the whole package and can take
-  minutes over SMB. `uai cache add "<package>"` once makes later exports instant.
+  minutes over SMB. `uai cache add "<package>"` once (on the machine with the share) makes later
+  exports instant.
 * Render pipeline mismatch (URP material into Built-in project) yields pink materials; check the
   package's `unity_version`/description in `uai packages` and the shader guid in `uai deps`.
 * The index tracks guid references only. `Resources.Load`, Addressables and `Shader.Find` by name are
   invisible; check scripts with `uai cat` if a prefab looks incomplete.
+* The user can browse the same index visually with `uai serve --open`; point them there when they
+  want to pick assets by eye.
