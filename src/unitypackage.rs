@@ -525,18 +525,25 @@ impl<R: Read> Read for CountingReader<R> {
     }
 }
 
-pub type PackageStream = tar::Archive<GzDecoder<Box<dyn Read + Send>>>;
+pub type PackageStream = tar::Archive<Box<dyn Read + Send>>;
 
 /// Open a `.unitypackage` for sequential reading. `counter` (optional) receives compressed bytes read.
+/// Most packages are gzipped tars; a few (hand-made or re-packed ones) are plain tars, which Unity
+/// also accepts, so the gzip layer is only added when the magic bytes say so.
 pub fn open_stream(path: &Path, counter: Option<Arc<AtomicU64>>) -> Result<PackageStream> {
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let buffered = BufReader::with_capacity(DEFAULT_BUFSIZE, file);
+    let mut buffered = BufReader::with_capacity(DEFAULT_BUFSIZE, file);
+    let is_gzip = {
+        use std::io::BufRead;
+        let head = buffered.fill_buf()?;
+        head.len() >= 2 && head[0] == 0x1f && head[1] == 0x8b
+    };
     let src: Box<dyn Read + Send> = match counter {
         Some(c) => Box::new(CountingReader { inner: buffered, counter: c }),
         None => Box::new(buffered),
     };
-    let gz = GzDecoder::new(src);
-    let mut archive = tar::Archive::new(gz);
+    let reader: Box<dyn Read + Send> = if is_gzip { Box::new(GzDecoder::new(src)) } else { src };
+    let mut archive = tar::Archive::new(reader);
     archive.set_ignore_zeros(true);
     archive.set_unpack_xattrs(false);
     archive.set_preserve_permissions(false);

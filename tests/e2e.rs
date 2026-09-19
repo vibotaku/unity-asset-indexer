@@ -192,6 +192,28 @@ fn fixture() -> Fixture {
 }
 
 #[test]
+fn reader_accepts_plain_tar_packages() {
+    let tmp = TempDir::new().unwrap();
+    let p = tmp.path().join("plain.unitypackage");
+    let mut tar = tar::Builder::new(Vec::new());
+    for (name, data) in [
+        ("asset.meta", meta(G_TEX, "TextureImporter", false)),
+        ("pathname", b"Assets/T.png".to_vec()),
+        ("asset", b"\x89PNG\x00".to_vec()),
+    ] {
+        let mut h = tar::Header::new_gnu();
+        h.set_size(data.len() as u64);
+        h.set_mode(0o644);
+        tar.append_data(&mut h, format!("{G_TEX}/{name}"), &data[..]).unwrap();
+    }
+    fs::write(&p, tar.into_inner().unwrap()).unwrap();
+    let entries = read_entries(&p, ScanOptions::default()).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].path, "Assets/T.png");
+    assert!(read_package_header(&p).is_none());
+}
+
+#[test]
 fn reader_handles_fextra_header_and_refs() {
     let f = fixture();
     let p = f.lib.join("Pub A/3D ModelsProps/Chest Pack.unitypackage");
