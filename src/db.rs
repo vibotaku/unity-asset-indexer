@@ -1,7 +1,8 @@
 //! SQLite storage for the asset index (FTS5 full-text search) plus the preview thumbnail store.
 //!
 //! The schema is compatible with the original Python `uai` index (schema version 1); version 2 adds
-//! `packages.previews_indexed` and the separate `previews.db` (attached as `pv`).
+//! `packages.previews_indexed` and the separate `previews.db` (attached as `pv`); version 3 adds
+//! `packages.root` (several library roots) with `UNIQUE(root, rel_path)`.
 
 use std::path::{Path, PathBuf};
 
@@ -11,13 +12,14 @@ use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
 use crate::model::{Asset, KindCount, Package, SearchQuery, Stats};
 use crate::unitypackage::Entry;
 
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS packages (
     id INTEGER PRIMARY KEY,
-    rel_path TEXT UNIQUE NOT NULL,
+    root TEXT NOT NULL DEFAULT '',
+    rel_path TEXT NOT NULL,
     name TEXT NOT NULL,
     publisher TEXT,
     category TEXT,
@@ -35,7 +37,9 @@ CREATE TABLE IF NOT EXISTS packages (
     store_id TEXT,
     category_label TEXT,
     description TEXT,
-    header TEXT
+    header TEXT,
+    previews_indexed INTEGER DEFAULT 0,
+    UNIQUE(root, rel_path)
 );
 CREATE TABLE IF NOT EXISTS assets (
     id INTEGER PRIMARY KEY,
@@ -153,6 +157,7 @@ fn asset_from_row(r: &Row<'_>) -> rusqlite::Result<Asset> {
 fn package_from_row(r: &Row<'_>) -> rusqlite::Result<Package> {
     Ok(Package {
         id: r.get("id")?,
+        root: r.get::<_, Option<String>>("root")?.unwrap_or_default(),
         rel_path: r.get("rel_path")?,
         name: r.get("name")?,
         publisher: r.get::<_, Option<String>>("publisher")?.unwrap_or_default(),
@@ -190,15 +195,10 @@ impl Database {
         conn.busy_timeout(std::time::Duration::from_secs(60))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        Self::migrate(&conn)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA).context("creating schema")?;
         let has_fts = conn.execute_batch(FTS_SCHEMA).is_ok();
-        // v1 -> v2 migration.
-        let has_col: bool =
-            conn.prepare("SELECT 1 FROM pragma_table_info('packages') WHERE name='previews_indexed'")?.exists([])?;
-        if !has_col {
-            conn.execute_batch("ALTER TABLE packages ADD COLUMN previews_indexed INTEGER DEFAULT 0")?;
-        }
         conn.execute("ATTACH DATABASE ?1 AS pv", params![previews.to_string_lossy().to_string()])
             .with_context(|| format!("attaching {}", previews.display()))?;
         conn.execute_batch(PREVIEW_SCHEMA).context("creating preview schema")?;
@@ -209,13 +209,79 @@ impl Database {
         Ok(Database { conn, path: path.to_path_buf(), has_fts })
     }
 
+    /// Bring an older index up to the current schema (runs before `foreign_keys` is switched on, so
+    /// rebuilding the packages table does not cascade into assets).
+    fn migrate(conn: &Connection) -> Result<()> {
+        let has_table: bool =
+            conn.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='packages'")?.exists([])?;
+        if !has_table {
+            return Ok(());
+        }
+        let has_col = |name: &str| -> rusqlite::Result<bool> {
+            conn.prepare(&format!("SELECT 1 FROM pragma_table_info('packages') WHERE name='{name}'"))?.exists([])
+        };
+        if !has_col("previews_indexed")? {
+            conn.execute_batch("ALTER TABLE packages ADD COLUMN previews_indexed INTEGER DEFAULT 0")?;
+        }
+        if !has_col("root")? {
+            // v2 -> v3: rebuild with `root` and UNIQUE(root, rel_path). Ids are preserved so the
+            // assets.package_id references stay valid. Foreign keys MUST be off here: the bundled
+            // SQLite defaults them to on, and `DROP TABLE packages` would otherwise cascade into
+            // `assets` (ON DELETE CASCADE) and wipe the index.
+            conn.pragma_update(None, "foreign_keys", "OFF")?;
+            let assets_before: i64 = conn.query_row("SELECT COUNT(*) FROM assets", [], |r| r.get(0)).unwrap_or(0);
+            conn.execute_batch(
+                r#"BEGIN;
+                CREATE TABLE packages_v3 (
+                    id INTEGER PRIMARY KEY, root TEXT NOT NULL DEFAULT '', rel_path TEXT NOT NULL, name TEXT NOT NULL,
+                    publisher TEXT, category TEXT, size INTEGER, mtime REAL, indexed_at REAL, entry_count INTEGER DEFAULT 0,
+                    total_bytes INTEGER DEFAULT 0, status TEXT DEFAULT 'ok', error TEXT, title TEXT, version TEXT,
+                    unity_version TEXT, pubdate TEXT, store_id TEXT, category_label TEXT, description TEXT, header TEXT,
+                    previews_indexed INTEGER DEFAULT 0, UNIQUE(root, rel_path));
+                INSERT INTO packages_v3 (id, root, rel_path, name, publisher, category, size, mtime, indexed_at, entry_count,
+                    total_bytes, status, error, title, version, unity_version, pubdate, store_id, category_label, description,
+                    header, previews_indexed)
+                  SELECT id, '', rel_path, name, publisher, category, size, mtime, indexed_at, entry_count, total_bytes,
+                    status, error, title, version, unity_version, pubdate, store_id, category_label, description, header,
+                    previews_indexed FROM packages;
+                DROP TABLE packages;
+                ALTER TABLE packages_v3 RENAME TO packages;
+                COMMIT;"#,
+            )
+            .context("migrating packages table to schema v3")?;
+            let assets_after: i64 = conn.query_row("SELECT COUNT(*) FROM assets", [], |r| r.get(0)).unwrap_or(0);
+            if assets_after != assets_before {
+                anyhow::bail!(
+                    "schema migration lost asset rows ({assets_before} -> {assets_after}); run `uai index --force`"
+                );
+            }
+        }
+        Ok(())
+    }
+
     // ----- packages -----------------------------------------------------------------------------
 
-    pub fn package_by_rel_path(&self, rel_path: &str) -> Result<Option<Package>> {
+    /// Packages indexed before roots were recorded (root = '') are assigned to `primary`.
+    pub fn assign_default_root(&self, primary: &str) -> Result<usize> {
+        if primary.is_empty() {
+            return Ok(0);
+        }
+        Ok(self.conn.execute("UPDATE packages SET root=?1 WHERE root=''", params![primary])?)
+    }
+
+    pub fn package_by_root_rel(&self, root: &str, rel_path: &str) -> Result<Option<Package>> {
         Ok(self
             .conn
-            .query_row("SELECT * FROM packages WHERE rel_path=?1", params![rel_path], package_from_row)
+            .query_row(
+                "SELECT * FROM packages WHERE root=?1 AND rel_path=?2",
+                params![root, rel_path],
+                package_from_row,
+            )
             .optional()?)
+    }
+
+    pub fn asset_count(&self, pid: i64) -> Result<i64> {
+        Ok(self.conn.query_row("SELECT COUNT(*) FROM assets WHERE package_id=?1", params![pid], |r| r.get(0))?)
     }
 
     pub fn package_by_id(&self, pid: i64) -> Result<Option<Package>> {
@@ -252,6 +318,7 @@ impl Database {
     #[allow(clippy::too_many_arguments)]
     pub fn upsert_package(
         &self,
+        root: &str,
         rel_path: &str,
         name: &str,
         publisher: &str,
@@ -272,9 +339,9 @@ impl Database {
         let header_json = header.map(|h| serde_json::Value::Object(h.clone()).to_string());
         self.conn.execute(
             r#"INSERT INTO packages(rel_path, name, publisher, category, size, mtime, title, version, unity_version,
-                                    pubdate, store_id, category_label, description, header)
-               VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
-               ON CONFLICT(rel_path) DO UPDATE SET name=excluded.name, publisher=excluded.publisher,
+                                    pubdate, store_id, category_label, description, header, root)
+               VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+               ON CONFLICT(root, rel_path) DO UPDATE SET name=excluded.name, publisher=excluded.publisher,
                  category=excluded.category, size=excluded.size, mtime=excluded.mtime,
                  title=COALESCE(excluded.title, packages.title), version=COALESCE(excluded.version, packages.version),
                  unity_version=COALESCE(excluded.unity_version, packages.unity_version),
@@ -296,10 +363,15 @@ impl Database {
                 store_id,
                 sub_label("category"),
                 hs("description"),
-                header_json
+                header_json,
+                root
             ],
         )?;
-        Ok(self.conn.query_row("SELECT id FROM packages WHERE rel_path=?1", params![rel_path], |r| r.get(0))?)
+        Ok(self.conn.query_row(
+            "SELECT id FROM packages WHERE root=?1 AND rel_path=?2",
+            params![root, rel_path],
+            |r| r.get(0),
+        )?)
     }
 
     pub fn mark_package(&self, pid: i64, status: &str, error: Option<&str>) -> Result<()> {

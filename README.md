@@ -49,7 +49,17 @@ uai search chest -k prefab
 uai export <guid> --project ~/MyGame         # streamed from the server, unpacked locally
 ```
 
-Settings live in `~/.unity-asset-index/config.json` (`library`, `server`); the index in
+Several library roots are fine: packages from all of them go into one index, and a root that is
+not mounted right now is skipped (its packages stay in the index) instead of failing the run.
+
+```bash
+uai config --add-library ~/UnityPacks            # append a root
+uai config --remove-library ~/UnityPacks
+uai --library /mnt/a --library /mnt/b index      # or per call; UAI_LIBRARY takes a path list (: or ;)
+uai packages                                     # shows @root when more than one root is indexed
+```
+
+Settings live in `~/.unity-asset-index/config.json` (`libraries`, `server`); the index in
 `~/.unity-asset-index/index.db`, thumbnails in `previews.db`. Override the directory with
 `--home` / `UAI_HOME`.
 
@@ -109,7 +119,8 @@ as the CLI's `--json` output.
 
 Thumbnails come from the `preview.png` files inside the packages and are stored during
 `uai index`. An index built by an older version has none yet: run `uai index` again (it re-scans
-packages that lack thumbnails) or leave it, the asset panel can pull a thumbnail on demand.
+packages that lack thumbnails) or leave it, the asset panel can pull a thumbnail on demand. Indexes
+written by the Python prototype (schema v1) are migrated in place on first open.
 
 ## For agents
 

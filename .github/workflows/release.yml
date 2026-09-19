@@ -20,12 +20,12 @@ jobs:
       matrix:
         include:
           - { os: macos-latest,   target: aarch64-apple-darwin,       archive: tar.gz }
-          - { os: macos-13,       target: x86_64-apple-darwin,        archive: tar.gz }
+          - { os: macos-latest,   target: x86_64-apple-darwin,        archive: tar.gz }
           - { os: windows-latest, target: x86_64-pc-windows-msvc,     archive: zip }
           - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu,   archive: tar.gz }
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, archive: tar.gz }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -57,7 +57,7 @@ jobs:
           Copy-Item -Recurse skills "dist/$Name/skills"
           Compress-Archive -Path "dist/$Name" -DestinationPath "dist/$Name.zip"
           (Get-FileHash "dist/$Name.zip" -Algorithm SHA256).Hash.ToLower() + "  $Name.zip" | Out-File -Encoding ascii "dist/$Name.zip.sha256"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.target }}
           path: |
@@ -69,8 +69,8 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
         with:
           path: dist
           merge-multiple: true

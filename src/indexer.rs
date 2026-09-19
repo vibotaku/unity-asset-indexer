@@ -107,23 +107,41 @@ pub fn index_library(
     log: &mut dyn FnMut(&str),
     mut progress: Option<&mut dyn FnMut(&str)>,
 ) -> Result<IndexReport> {
-    let lib = &cfg.library;
-    if !cfg.library_mounted() {
+    if cfg.libraries.is_empty() {
+        bail!("no library configured: set UAI_LIBRARY or `uai config --set-library <dir>` / `--add-library <dir>`");
+    }
+    let mut mounted: Vec<String> = Vec::new();
+    for root in &cfg.libraries {
+        if root.is_dir() {
+            mounted.push(root.to_string_lossy().to_string());
+        } else {
+            log(&format!("- library root not reachable, skipped: {} (is the share mounted?)", root.display()));
+        }
+    }
+    if mounted.is_empty() {
         bail!(
-            "Library not found: {} (is the share mounted? set UAI_LIBRARY or `uai config --library <dir>`)",
-            lib.display()
+            "no library root is reachable: {} (is the share mounted? set UAI_LIBRARY or `uai config --set-library <dir>`)",
+            cfg.libraries_display()
         );
     }
-    let mut paths = discover_packages(lib);
-    if let Some(only) = opts.only.as_deref().map(|s| s.to_ascii_lowercase()) {
-        paths.retain(|p| rel_path(lib, p).to_ascii_lowercase().contains(&only));
+    db.assign_default_root(&cfg.primary_library().to_string_lossy())?;
+    // (root, package path, rel path)
+    let mut paths: Vec<(String, PathBuf, String)> = Vec::new();
+    for root in &mounted {
+        let rp = Path::new(root);
+        for p in discover_packages(rp) {
+            let rel = rel_path(rp, &p);
+            paths.push((root.clone(), p, rel));
+        }
     }
-    let mut seen_rel: Vec<String> = Vec::new();
+    if let Some(only) = opts.only.as_deref().map(|s| s.to_ascii_lowercase()) {
+        paths.retain(|(_, _, rel)| rel.to_ascii_lowercase().contains(&only));
+    }
+    let mut seen: Vec<(String, String)> = Vec::new();
     let mut todo: Vec<(i64, PathBuf, u64)> = Vec::new();
     let mut skipped = 0usize;
-    for p in &paths {
-        let rel = rel_path(lib, p);
-        seen_rel.push(rel.clone());
+    for (root, p, rel) in &paths {
+        seen.push((root.clone(), rel.clone()));
         let md = match std::fs::metadata(p) {
             Ok(m) => m,
             Err(e) => {
@@ -133,15 +151,15 @@ pub fn index_library(
         };
         let size = md.len() as i64;
         let mtime = mtime_secs(&md);
-        let existing = db.package_by_rel_path(&rel)?;
-        let (name, publisher, category) = split_rel_path(&rel);
+        let existing = db.package_by_root_rel(root, rel)?;
+        let (name, publisher, category) = split_rel_path(rel);
         let changed = match &existing {
             None => true,
             Some(ex) => ex.size != size || (ex.mtime - mtime).abs() >= 1.0,
         };
         let need_header = opts.force || changed || existing.as_ref().map(|e| e.title.is_none()).unwrap_or(true);
         let header = if need_header { read_package_header(p) } else { None };
-        let pid = db.upsert_package(&rel, &name, &publisher, &category, size, mtime, header.as_ref())?;
+        let pid = db.upsert_package(root, rel, &name, &publisher, &category, size, mtime, header.as_ref())?;
         let up_to_date = match &existing {
             Some(ex) => {
                 !opts.force
@@ -149,6 +167,7 @@ pub fn index_library(
                     && ex.indexed_at.is_some()
                     && !changed
                     && (!opts.previews || ex.previews_indexed)
+                    && (ex.entry_count == 0 || db.asset_count(ex.id)? > 0)
             }
             None => false,
         };
@@ -159,10 +178,12 @@ pub fn index_library(
         todo.push((pid, p.clone(), md.len()));
     }
 
+    // Packages that vanished from a root we could read are dropped; packages under an unreachable root
+    // are kept (the share may simply be unmounted right now).
     let mut removed = 0usize;
     if opts.only.is_none() {
         for row in db.packages()? {
-            if !seen_rel.contains(&row.rel_path) {
+            if mounted.contains(&row.root) && !seen.iter().any(|(r, rel)| *r == row.root && *rel == row.rel_path) {
                 log(&format!("- removed from library: {}", row.rel_path));
                 db.delete_package(row.id)?;
                 removed += 1;
@@ -183,8 +204,15 @@ pub fn index_library(
     }
 
     let counter = Arc::new(AtomicU64::new(0));
+    let rel_of = |p: &Path| -> String {
+        paths
+            .iter()
+            .find(|(_, pp, _)| pp == p)
+            .map(|(_, _, rel)| rel.clone())
+            .unwrap_or_else(|| p.to_string_lossy().to_string())
+    };
     let queue: Arc<Mutex<VecDeque<(i64, PathBuf, String)>>> =
-        Arc::new(Mutex::new(todo.iter().map(|(pid, p, _)| (*pid, p.clone(), rel_path(lib, p))).collect()));
+        Arc::new(Mutex::new(todo.iter().map(|(pid, p, _)| (*pid, p.clone(), rel_of(p))).collect()));
     let (tx, rx) = mpsc::channel::<Msg>();
     let scan_opts = ScanOptions { keep_previews: opts.previews, ..Default::default() };
     let mut handles = Vec::new();

@@ -117,7 +117,8 @@ pub fn plan_out(db: &Database, plan: &Plan, roots: &[Asset]) -> Result<PlanOut> 
 // ----- reading members from a package (cache or stream) -------------------------------------------
 
 pub fn package_abs_path(cfg: &Config, pkg: &Package) -> PathBuf {
-    cfg.library.join(&pkg.rel_path)
+    let root = if pkg.root.is_empty() { cfg.primary_library() } else { PathBuf::from(&pkg.root) };
+    root.join(&pkg.rel_path)
 }
 
 pub fn cache_path_for(cfg: &Config, pkg_id: i64) -> PathBuf {

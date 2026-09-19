@@ -100,7 +100,7 @@
     const [stats, packages, publishers, kinds] = await Promise.all([api('/api/stats'), api('/api/packages'), api('/api/publishers'), api('/api/kinds')]);
     state.packages = packages;
     for (const k of kinds) state.kindCounts[k.kind] = k.n;
-    $('stats').textContent = `${stats.packages} packages · ${stats.assets.toLocaleString()} assets · ${human(stats.bytes)}` + (stats.library_mounted ? '' : ' · library offline');
+    $('stats').textContent = `${stats.packages} packages · ${stats.assets.toLocaleString()} assets · ${human(stats.bytes)}` + (stats.library_mounted ? ((stats.libraries || []).some((l) => !l.mounted) ? ' · some roots offline' : '') : ' · library offline');
     const ps = $('packageSel');
     ps.innerHTML = '<option value="">All packages</option>';
     for (const p of packages) ps.append(el('option', { value: String(p.id), text: `${p.name} (${p.entry_count.toLocaleString()})` }));
@@ -118,7 +118,7 @@
     for (const p of state.packages) {
       if (f && !(`${p.name} ${p.publisher} ${p.title || ''}`.toLowerCase().includes(f))) continue;
       if (p.publisher !== lastPub) { list.append(el('li', { class: 'pub', text: p.publisher || '—' })); lastPub = p.publisher; }
-      const li = el('li', { class: String(p.id) === state.package ? 'active' : '', title: p.rel_path, onclick: () => selectPackage(p) },
+      const li = el('li', { class: String(p.id) === state.package ? 'active' : '', title: (p.root ? p.root + '/' : '') + p.rel_path, onclick: () => selectPackage(p) },
         el('span', { class: 'name', text: p.name }),
         el('span', { class: 'sub', text: `${p.entry_count.toLocaleString()} assets · ${human(p.total_bytes)}${p.version ? ' · v' + p.version : ''}${p.status !== 'ok' ? ' · ' + p.status : ''}` }));
       list.append(li);
@@ -221,6 +221,7 @@
     if (p.pubdate) meta.append(el('span', { text: p.pubdate }));
     meta.append(el('span', { text: `${p.entry_count.toLocaleString()} assets · ${human(p.total_bytes)} unpacked · ${human(p.size)} package` }));
     if (p.cached) meta.append(el('span', { text: 'cached locally' }));
+    if (p.root) meta.append(el('span', { text: p.root + '/' + p.rel_path, title: 'package file' }));
     box.append(meta);
     if (p.description) {
       const d = el('div', { class: 'desc', text: p.description.replace(/<[^>]+>/g, '') });

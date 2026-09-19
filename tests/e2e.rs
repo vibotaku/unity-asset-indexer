@@ -180,7 +180,7 @@ fn fixture() -> Fixture {
     );
     let home = root.join("home");
     fs::create_dir_all(&home).unwrap();
-    let cfg = Config { library: lib.clone(), home, server: None };
+    let cfg = Config { libraries: vec![lib.clone()], home, server: None };
     let mut db = Database::open_with_previews(&cfg.db_path(), &cfg.previews_path()).unwrap();
     let opts = IndexOptions { workers: 1, ..Default::default() };
     let mut log = |_: &str| {};
@@ -449,4 +449,97 @@ fn server_and_remote_client() {
     fs::File::open(&pkg_out).unwrap().read_exact(&mut header).unwrap();
     assert_eq!(header, [0x1f, 0x8b]);
     handle.abort();
+}
+
+#[test]
+fn multiple_library_roots() {
+    let f = fixture();
+    // A second root with its own package; an unreachable third root must not break indexing.
+    let lib2 = f.root.join("lib2");
+    fs::create_dir_all(lib2.join("Pub C/Audio")).unwrap();
+    make_package(
+        &lib2.join("Pub C/Audio/Sounds.unitypackage"),
+        &[E {
+            guid: "dddddddddddddddddddddddddddddd01",
+            path: "Assets/Sounds/hit.wav",
+            asset: Some(b"RIFF\x00\x00fake".to_vec()),
+            meta: meta("dddddddddddddddddddddddddddddd01", "AudioImporter", false),
+            preview: false,
+        }],
+        None,
+    );
+    let cfg = Config {
+        libraries: vec![f.lib.clone(), lib2.clone(), f.root.join("missing")],
+        home: f.cfg.home.clone(),
+        server: None,
+    };
+    let mut db = Database::open_with_previews(&cfg.db_path(), &cfg.previews_path()).unwrap();
+    let mut log = |_: &str| {};
+    let rep = index_library(&cfg, &mut db, &IndexOptions { workers: 1, ..Default::default() }, &mut log, None).unwrap();
+    assert_eq!((rep.indexed, rep.skipped, rep.removed), (1, 2, 0), "{rep:?}");
+    let svc = LocalService::open(&cfg).unwrap();
+    let pkgs = svc.packages().unwrap();
+    assert_eq!(pkgs.len(), 3);
+    let sounds = svc.find_package("Sounds").unwrap();
+    assert_eq!(sounds.root, lib2.to_string_lossy());
+    assert_eq!(svc.find_package("Chest Pack").unwrap().root, f.lib.to_string_lossy());
+    // Export resolves the package file through its own root.
+    let out = f.root.join("multi_out");
+    let req = ExportRequest { identifiers: vec!["hit.wav".into()], ..Default::default() };
+    let res = svc.export(&req, &uai::service::ExportDest::Dir(out.clone()), &Default::default(), &mut log).unwrap();
+    assert!(res.result.missing_in_package.is_empty());
+    assert!(out.join("Assets/Sounds/hit.wav.meta").is_file());
+    // Indexing with only the first root reachable keeps lib2's package (its root is not mounted).
+    let cfg1 = Config { libraries: vec![f.lib.clone(), f.root.join("gone")], home: f.cfg.home.clone(), server: None };
+    let rep =
+        index_library(&cfg1, &mut db, &IndexOptions { workers: 1, ..Default::default() }, &mut log, None).unwrap();
+    assert_eq!(rep.removed, 0);
+    assert_eq!(svc.packages().unwrap().len(), 3);
+    // Deleting the package from lib2 and indexing with lib2 reachable removes it.
+    fs::remove_file(lib2.join("Pub C/Audio/Sounds.unitypackage")).unwrap();
+    let rep = index_library(&cfg, &mut db, &IndexOptions { workers: 1, ..Default::default() }, &mut log, None).unwrap();
+    assert_eq!(rep.removed, 1);
+}
+
+/// An index written by the Python prototype / uai 0.1 (schema v1: no `root`, no `previews_indexed`,
+/// `rel_path UNIQUE`) must migrate without losing a single asset row, even though the bundled SQLite
+/// turns foreign keys on by default.
+#[test]
+fn migrates_v1_index_without_losing_assets() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("index.db");
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+             CREATE TABLE packages (id INTEGER PRIMARY KEY, rel_path TEXT UNIQUE NOT NULL, name TEXT NOT NULL, publisher TEXT,
+               category TEXT, size INTEGER, mtime REAL, indexed_at REAL, entry_count INTEGER DEFAULT 0, total_bytes INTEGER DEFAULT 0,
+               status TEXT DEFAULT 'ok', error TEXT, title TEXT, version TEXT, unity_version TEXT, pubdate TEXT, store_id TEXT,
+               category_label TEXT, description TEXT, header TEXT);
+             CREATE TABLE assets (id INTEGER PRIMARY KEY, package_id INTEGER NOT NULL REFERENCES packages(id) ON DELETE CASCADE,
+               guid TEXT NOT NULL, path TEXT NOT NULL, name TEXT NOT NULL, ext TEXT, kind TEXT, importer TEXT, main_class TEXT,
+               size INTEGER DEFAULT 0, is_folder INTEGER DEFAULT 0, has_preview INTEGER DEFAULT 0, is_text INTEGER DEFAULT 0,
+               scan_truncated INTEGER DEFAULT 0, labels TEXT, UNIQUE(package_id, guid));
+             CREATE TABLE refs (asset_id INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE, dep_guid TEXT NOT NULL,
+               PRIMARY KEY (asset_id, dep_guid)) WITHOUT ROWID;
+             INSERT INTO packages (id, rel_path, name, publisher, indexed_at, entry_count, status) VALUES (7, 'Pub/Cat/P.unitypackage', 'P', 'Pub', 1.0, 2, 'ok');
+             INSERT INTO assets (id, package_id, guid, path, name, kind) VALUES (1, 7, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1', 'Assets/A.prefab', 'A.prefab', 'prefab');
+             INSERT INTO assets (id, package_id, guid, path, name, kind) VALUES (2, 7, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa2', 'Assets/B.mat', 'B.mat', 'material');
+             INSERT INTO refs VALUES (1, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa2');",
+        )
+        .unwrap();
+    }
+    let db = Database::open(&db_path).unwrap();
+    assert_eq!(db.asset_count(7).unwrap(), 2);
+    assert_eq!(db.refs_of(1).unwrap(), vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa2".to_string()]);
+    let p = db.package_by_id(7).unwrap().unwrap();
+    assert_eq!(p.root, "");
+    assert!(!p.previews_indexed);
+    db.assign_default_root("/lib").unwrap();
+    assert_eq!(db.package_by_root_rel("/lib", "Pub/Cat/P.unitypackage").unwrap().unwrap().id, 7);
+    // Re-opening is idempotent.
+    drop(db);
+    let db = Database::open(&db_path).unwrap();
+    assert_eq!(db.asset_count(7).unwrap(), 2);
+    assert_eq!(db.stats().unwrap().assets, 2);
 }

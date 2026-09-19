@@ -24,9 +24,9 @@ const IDENT_HELP: &str = "guid | Package::Assets/path | Assets/path | path suffi
     about = "Search, preview and extract individual assets from a library of .unitypackage files."
 )]
 struct Cli {
-    /// Library root (default: config / $UAI_LIBRARY)
-    #[arg(long, global = true)]
-    library: Option<String>,
+    /// Library root; repeat for several roots (default: config / $UAI_LIBRARY, path-list separated)
+    #[arg(long, global = true, action = clap::ArgAction::Append)]
+    library: Vec<String>,
     /// Index/cache dir (default: ~/.unity-asset-index or $UAI_HOME)
     #[arg(long, global = true)]
     home: Option<String>,
@@ -51,9 +51,15 @@ struct JsonFlag {
 enum Cmd {
     /// Show settings and index stats
     Config {
-        /// Persist a new library root
+        /// Persist a single library root (replaces the list)
         #[arg(long = "set-library", value_name = "DIR")]
         set_library: Option<String>,
+        /// Add a library root to the list
+        #[arg(long = "add-library", value_name = "DIR", action = clap::ArgAction::Append)]
+        add_library: Vec<String>,
+        /// Remove a library root from the list
+        #[arg(long = "remove-library", value_name = "DIR", action = clap::ArgAction::Append)]
+        remove_library: Vec<String>,
         /// Persist a default server URL for remote mode
         #[arg(long = "set-server", value_name = "URL", conflicts_with = "clear_server")]
         set_server: Option<String>,
@@ -267,13 +273,13 @@ fn main() {
 }
 
 fn run(cli: Cli) -> Result<()> {
-    let mut cfg = Config::load(cli.library.as_deref(), cli.home.as_deref(), cli.server.as_deref())?;
+    let mut cfg = Config::load(&cli.library, cli.home.as_deref(), cli.server.as_deref())?;
     if cli.local {
         cfg.server = None;
     }
     match cli.cmd {
-        Cmd::Config { set_library, set_server, clear_server, json } => {
-            cmd_config(cfg, set_library, set_server, clear_server, json.json)
+        Cmd::Config { set_library, add_library, remove_library, set_server, clear_server, json } => {
+            cmd_config(cfg, set_library, add_library, remove_library, set_server, clear_server, json.json)
         }
         Cmd::Index { workers, force, only, no_previews, json } => {
             cmd_index(&cfg, workers, force, only, !no_previews, json.json)
@@ -365,12 +371,22 @@ fn run(cli: Cli) -> Result<()> {
 fn cmd_config(
     mut cfg: Config,
     set_library: Option<String>,
+    add_library: Vec<String>,
+    remove_library: Vec<String>,
     set_server: Option<String>,
     clear_server: bool,
     json: bool,
 ) -> Result<()> {
     if let Some(l) = set_library {
         cfg.save_library(&l)?;
+    }
+    for l in &add_library {
+        cfg.add_library(l)?;
+    }
+    for l in &remove_library {
+        if !cfg.remove_library(l)? {
+            eprintln!("note: {l} was not in the library list");
+        }
     }
     if let Some(s) = set_server {
         cfg.save_server(Some(&s))?;
@@ -379,7 +395,16 @@ fn cmd_config(
         cfg.save_server(None)?;
     }
     let mut info: BTreeMap<&str, serde_json::Value> = BTreeMap::new();
-    info.insert("library", cfg.library.to_string_lossy().to_string().into());
+    info.insert("library", cfg.libraries_display().into());
+    info.insert(
+        "libraries",
+        serde_json::Value::Array(
+            cfg.libraries
+                .iter()
+                .map(|p| serde_json::json!({"path": p.to_string_lossy(), "mounted": p.is_dir()}))
+                .collect(),
+        ),
+    );
     info.insert("library_mounted", cfg.library_mounted().into());
     info.insert("home", cfg.home.to_string_lossy().to_string().into());
     info.insert("db", cfg.db_path().to_string_lossy().to_string().into());
@@ -408,9 +433,20 @@ fn cmd_config(
         return out_json(&info);
     }
     for (k, v) in &info {
+        if *k == "library" {
+            continue;
+        }
         let s = match v {
             serde_json::Value::String(s) => s.clone(),
             serde_json::Value::Null => "-".into(),
+            serde_json::Value::Array(a) if *k == "libraries" => a
+                .iter()
+                .map(|e| {
+                    let mounted = e["mounted"].as_bool().unwrap_or(false);
+                    format!("{}{}", e["path"].as_str().unwrap_or(""), if mounted { "" } else { "  (not mounted)" })
+                })
+                .collect::<Vec<_>>()
+                .join("\n                 "),
             other => other.to_string(),
         };
         println!("{k:16} {s}");
@@ -472,6 +508,8 @@ fn cmd_packages(svc: &dyn Service, json: bool) -> Result<()> {
     if json {
         return out_json(&rows);
     }
+    let roots: std::collections::BTreeSet<&str> = rows.iter().map(|r| r.root.as_str()).collect();
+    let multi_root = roots.len() > 1;
     println!(
         "{:>3}  {:>7}  {:>9}  {:>9}  {:>9}  {:>11}  publisher / name  [category]",
         "id", "assets", "unpacked", "package", "version", "unity"
@@ -483,6 +521,11 @@ fn cmd_packages(svc: &dyn Service, json: bool) -> Result<()> {
         }
         if r.cached {
             flags.push_str("  [cached]");
+        }
+        if multi_root {
+            let short =
+                std::path::Path::new(&r.root).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            flags.push_str(&format!("  @{short}"));
         }
         println!(
             "{:>3}  {:>7}  {:>9}  {:>9}  {:>9}  {:>11}  {} / {}  [{}]{}",

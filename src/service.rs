@@ -89,6 +89,7 @@ pub struct LocalService {
 impl LocalService {
     pub fn open(cfg: &Config) -> Result<LocalService> {
         let db = Database::open_with_previews(&cfg.db_path(), &cfg.previews_path())?;
+        let _ = db.assign_default_root(&cfg.primary_library().to_string_lossy());
         Ok(LocalService { cfg: cfg.clone(), db })
     }
 

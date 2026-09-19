@@ -118,7 +118,16 @@ async fn api_stats(State(st): State<Shared>) -> ApiResult<Json<serde_json::Value
     let stats = with_svc(&st, |s| s.stats()).await?;
     let mut v = serde_json::to_value(&stats).map_err(|e| ApiErr(e.into()))?;
     if let Some(o) = v.as_object_mut() {
-        o.insert("library".into(), cfg.library.to_string_lossy().to_string().into());
+        o.insert("library".into(), cfg.libraries_display().into());
+        o.insert(
+            "libraries".into(),
+            serde_json::Value::Array(
+                cfg.libraries
+                    .iter()
+                    .map(|p| serde_json::json!({"path": p.to_string_lossy(), "mounted": p.is_dir()}))
+                    .collect(),
+            ),
+        );
         o.insert("library_mounted".into(), cfg.library_mounted().into());
         o.insert("version".into(), crate::VERSION.into());
     }
@@ -449,7 +458,7 @@ pub fn serve(cfg: Config, bind: &str, open: bool) -> Result<()> {
             stats.packages,
             stats.assets,
             stats.previews,
-            cfg.library.display(),
+            cfg.libraries_display(),
             if cfg.library_mounted() {
                 "mounted"
             } else {

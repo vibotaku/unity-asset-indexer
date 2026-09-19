@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Package {
     pub id: i64,
+    /// Library root this package was found under.
+    #[serde(default)]
+    pub root: String,
     pub rel_path: String,
     pub name: String,
     #[serde(default)]
