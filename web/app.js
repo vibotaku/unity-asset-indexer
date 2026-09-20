@@ -30,6 +30,44 @@
   const IMG_EXT = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg']);
   const AUDIO_EXT = new Set(['wav', 'mp3', 'ogg', 'flac', 'aif', 'aiff']);
   const VIDEO_EXT = new Set(['mp4', 'webm', 'mov']);
+  const MODEL_EXT = new Set(['fbx', 'obj', 'glb', 'gltf']);
+  let activeViewer = null;
+  function dropViewer() { if (activeViewer) { try { activeViewer.dispose(); } catch (_) {} activeViewer = null; } }
+
+  /* Mount the three.js viewer into the preview box and load a model; returns the viewer + a toolbar. */
+  async function show3D(pv, a, modelAsset, after) {
+    if (!window.UaiViewer) { toast('3D viewer is not loaded', true); return null; }
+    dropViewer();
+    pv.innerHTML = '';
+    pv.classList.add('viewer');
+    const bar = el('div', { class: 'viewer-bar' });
+    pv.after(bar);
+    bar.append(el('span', { class: 'muted' }, el('span', { class: 'spinner' }), ` loading ${modelAsset.name} (${human(modelAsset.size)})…`));
+    const viewer = window.UaiViewer.createViewer(pv, { textureUrl: (name) => `/api/raw?ident=${encodeURIComponent(name)}&package=${modelAsset.package_id}&near=${modelAsset.id}` });
+    activeViewer = viewer;
+    window.__uaiViewer = viewer;
+    try {
+      const info = await viewer.load(`/api/assets/${modelAsset.id}/raw`, (modelAsset.ext || '').toLowerCase());
+      if (activeViewer !== viewer) return null;
+      bar.innerHTML = '';
+      if (info.clips.length) {
+        const sel = el('select', { 'data-clip': '1', onchange: () => viewer.play(+sel.value) });
+        info.clips.forEach((c, i) => sel.append(el('option', { value: String(i), text: `${c.name || 'clip ' + (i + 1)} (${c.duration.toFixed(2)}s)` })));
+        bar.append(el('span', { class: 'muted', text: 'clip' }), sel);
+      }
+      let paused = false;
+      const pause = el('button', { class: 'ghost', type: 'button', text: '❚❚', title: 'Pause / resume', onclick: () => { paused = !paused; viewer.setPaused(paused); pause.textContent = paused ? '▶' : '❚❚'; } });
+      const speed = el('select', { onchange: () => viewer.setSpeed(+speed.value) }, ...['0.25', '0.5', '1', '2'].map((v) => el('option', { value: v, text: v + '×', selected: v === '1' })));
+      bar.append(pause, speed, el('button', { class: 'ghost', type: 'button', text: 'Fit', onclick: () => viewer.frame() }));
+      bar.append(el('span', { class: 'muted', text: `${info.bones} bones · ${info.clips.length} clip(s) · drag to orbit, wheel to zoom` }));
+      if (after) await after(viewer, bar, info);
+      return viewer;
+    } catch (e) {
+      bar.innerHTML = '';
+      bar.append(el('span', { class: 'muted', text: 'Could not load: ' + (e && e.message ? e.message : e) }));
+      return null;
+    }
+  }
   const PAGE = 60;
 
   const state = {
@@ -287,6 +325,7 @@
     renderDetail(info);
   }
   function closeDetail() {
+    dropViewer();
     state.detailId = null;
     writeHash();
     $('detail').classList.add('hidden');
@@ -297,6 +336,7 @@
   function renderDetail(info) {
     const a = info;
     const panel = $('detail');
+    dropViewer();
     panel.innerHTML = '';
     const inner = el('div', { class: 'detail-inner' });
     const inBasket = state.basket.has(a.guid);
@@ -312,6 +352,7 @@
     if (IMG_EXT.has(ext)) tools.append(el('button', { class: 'ghost', type: 'button', text: `View original (${human(a.size)})`, onclick: (e) => { e.target.disabled = true; pv.innerHTML = ''; const img = el('img', { src: raw, alt: a.name }); img.addEventListener('error', () => toast('Could not load the original image', true)); pv.append(img); } }));
     if (AUDIO_EXT.has(ext)) tools.append(el('button', { class: 'ghost', type: 'button', text: `▶ Play (${human(a.size)})`, onclick: (e) => { e.target.disabled = true; pv.innerHTML = ''; pv.append(el('audio', { controls: true, autoplay: true, src: raw })); } }));
     if (VIDEO_EXT.has(ext)) tools.append(el('button', { class: 'ghost', type: 'button', text: `▶ Play (${human(a.size)})`, onclick: (e) => { e.target.disabled = true; pv.innerHTML = ''; pv.append(el('video', { controls: true, autoplay: true, src: raw })); } }));
+    if (MODEL_EXT.has(ext)) tools.append(el('button', { class: 'primary', type: 'button', text: `View in 3D (${human(a.size)})`, onclick: (e) => { e.target.disabled = true; show3D(pv, a, a); } }));
     if (a.has_preview) tools.append(el('button', { class: 'ghost', type: 'button', text: 'Load preview from package', title: 'The thumbnail is read from the package file and cached for next time', onclick: (e) => { e.target.disabled = true; pv.innerHTML = '<span class="spinner"></span>'; const img = el('img', { src: `/api/assets/${a.id}/preview.png?extract=1&t=${Date.now()}`, alt: a.name }); img.addEventListener('load', () => { pv.innerHTML = ''; pv.append(img); }); img.addEventListener('error', () => { pv.innerHTML = ''; pv.append(el('span', { class: 'ph', text: KIND_ICON[a.kind] || '•' })); toast('Could not load the preview', true); }); } }));
     if (!a.is_folder) tools.append(el('a', { href: raw + '?download=1', download: a.name, text: 'download file' }));
     if (tools.children.length) inner.append(tools);
@@ -335,6 +376,7 @@
       ['Dependencies', () => renderDeps(a, body)],
       [`Used by (${a.referrers.length})`, () => renderReferrers(a, body)],
     ];
+    if (ext === 'anim') tabDefs.unshift(['Animation', () => renderAnim(a, body, pv)]);
     if (a.is_text) tabDefs.push(['Content', () => renderText(a, body)]);
     tabDefs.forEach(([label, fn], i) => {
       const b = el('button', { type: 'button', text: label, class: i === 0 ? 'active' : '', onclick: () => { tabs.querySelectorAll('button').forEach((x) => x.classList.remove('active')); b.classList.add('active'); fn(); } });
@@ -389,6 +431,168 @@
     const ul = el('ul', { class: 'list-plain' });
     for (const r of a.referrers) ul.append(el('li', { onclick: () => openDetail(r.id), title: r.path }, el('span', { class: 'badge', text: r.kind }), ' ', r.name, el('span', { class: 'muted', text: `  [${r.package}]` })));
     body.append(ul);
+  }
+
+  /* .anim clips: stats + curves, and playback on an FBX from the same package (generic rigs only). */
+  async function renderAnim(a, body, pv) {
+    body.innerHTML = '<span class="spinner"></span>';
+    let parsed;
+    try {
+      const t = await api(`/api/text?ident=${encodeURIComponent('#' + a.id)}&max_bytes=${64 << 20}`);
+      parsed = window.UaiViewer ? window.UaiViewer.parseUnityAnim(t.text) : null;
+    } catch (e) { body.textContent = e.message; return; }
+    body.innerHTML = '';
+    if (!parsed) { body.append(el('p', { class: 'muted', text: '3D viewer is not loaded.' })); return; }
+    const wrap = { 0: 'default', 1: 'once', 2: 'loop', 4: 'ping-pong', 8: 'clamp forever' }[parsed.wrapMode] || String(parsed.wrapMode);
+    const dl = el('dl', { class: 'anim-summary' });
+    const row = (k, v) => dl.append(el('dt', { text: k }), el('dd', { text: v }));
+    row('length', `${parsed.length.toFixed(2)} s · ${parsed.sampleRate} fps · ${Math.round(parsed.length * parsed.sampleRate)} frames`);
+    row('wrap', wrap + (parsed.legacy ? ' · legacy' : ''));
+    row('type', parsed.humanoid ? `humanoid (${parsed.muscleCurves} muscle curves)` : 'generic (transform curves)');
+    const sprites = parsed.pptr.filter((c) => /m_Sprite/.test(c.attribute) || !c.attribute);
+    const spriteFrames = sprites.reduce((n, c) => n + c.keys.length, 0);
+    row('curves', `${parsed.euler.length} euler · ${parsed.rotation.length} rotation · ${parsed.position.length} position · ${parsed.scale.length} scale · ${parsed.floats.length} float` + (spriteFrames ? ` · ${spriteFrames} sprite frames` : ''));
+    body.append(dl);
+    if (spriteFrames) { await renderFlipbook(a, body, pv, parsed, sprites[0]); return; }
+    const paths = [...new Set([...parsed.euler, ...parsed.rotation, ...parsed.position, ...parsed.scale].map((c) => c.path || '(root)'))];
+    if (paths.length) body.append(el('div', { class: 'anim-paths', text: paths.join('\n') }));
+    else if (parsed.floats.length) body.append(el('div', { class: 'anim-paths', text: parsed.floats.slice(0, 60).map((f) => (f.path ? f.path + ' : ' : '') + f.attribute).join('\n') + (parsed.floats.length > 60 ? `\n… ${parsed.floats.length - 60} more` : '') }));
+    const tokens = (s) => new Set(s.toLowerCase().split(/[^a-z0-9]+/).filter((t) => t.length > 2));
+    const animTokens = tokens(a.path);
+    const overlap = (name) => [...tokens(name)].filter((t) => animTokens.has(t)).length;
+    if (parsed.humanoid || !paths.length) {
+      body.append(el('p', { class: 'muted', text: parsed.humanoid
+        ? 'Humanoid clips are stored as muscle values and need Unity\'s retargeter to play; the curve list above is the best preview outside Unity.'
+        : 'This clip animates no transforms, so there is nothing to play on a model.' }));
+      // Publishers often ship the source FBX with the clips embedded; those play in the 3D viewer.
+      try {
+        const l = await api('/api/ls?' + new URLSearchParams({ package: String(a.package_id), kind: 'model', limit: '2000' }));
+        const cands = l.assets.filter((m) => /^fbx$/i.test(m.ext) && /(anim|rig|source|motion|mocap)/i.test(m.path))
+          .map((m) => ({ m, s: overlap(m.path) })).sort((x, y) => y.s - x.s || y.m.size - x.m.size).slice(0, 6);
+        if (cands.length) {
+          const ul = el('ul', { class: 'list-plain' });
+          for (const { m } of cands) ul.append(el('li', { onclick: () => openDetail(m.id), title: m.path }, el('span', { class: 'badge', text: 'fbx' }), ' ', m.name, el('span', { class: 'muted', text: '  ' + human(m.size) })));
+          body.append(el('div', { class: 'muted', text: 'FBX files in this package that may contain this animation (open and use View in 3D):' }), ul);
+        }
+      } catch (_) {}
+      return;
+    }
+    // Candidate rigs: FBX files in the same package, nearest folder first.
+    const ctl = el('div', { class: 'viewer-bar' }, el('span', { class: 'muted' }, el('span', { class: 'spinner' }), ' finding models…'));
+    body.append(ctl);
+    let models = [];
+    try {
+      const l = await api('/api/ls?' + new URLSearchParams({ package: String(a.package_id), kind: 'model', limit: '2000' }));
+      const dirOf = (p) => p.split('/').slice(0, -1);
+      const mine = dirOf(a.path);
+      const common = (p) => { const d = dirOf(p); let i = 0; while (i < d.length && i < mine.length && d[i] === mine[i]) i++; return i; };
+      // Nearest folder first, then shared name tokens (e.g. "Rig_Medium"), then the bigger file (characters beat props).
+      models = l.assets.filter((m) => /^(fbx|obj|glb|gltf)$/i.test(m.ext))
+        .sort((x, y) => common(y.path) - common(x.path) || overlap(y.name) - overlap(x.name) || y.size - x.size || x.path.localeCompare(y.path));
+    } catch (_) {}
+    ctl.innerHTML = '';
+    if (!models.length) { ctl.append(el('span', { class: 'muted', text: 'No model files in this package to play the clip on.' })); return; }
+    const sel = el('select', { title: 'Model to play the clip on' });
+    models.forEach((m) => sel.append(el('option', { value: String(m.id), text: m.name })));
+    const axis = el('select', { title: 'Axis convention fix' }, el('option', { value: 'x', text: 'mirror X (Unity default)' }), el('option', { value: 'z', text: 'mirror Z' }), el('option', { value: 'none', text: 'no mirroring' }));
+    const status = el('span', { class: 'muted' });
+    const run = async () => {
+      const m = models.find((x) => String(x.id) === sel.value);
+      status.textContent = '';
+      await show3D(pv, a, m, async (viewer, bar) => {
+        const { clip, matched, missing } = window.UaiViewer.clipFromUnityAnim(parsed, viewer.model, { axis: axis.value, name: a.name });
+        viewer.playClip(clip);
+        status.textContent = `${matched.length} of ${matched.length + missing.length} animated nodes found in ${m.name}` + (missing.length ? ` (missing: ${missing.slice(0, 5).join(', ')}${missing.length > 5 ? '…' : ''})` : '');
+        const r = bar.querySelector('select[data-clip]'); if (r) { r.previousSibling && r.previousSibling.remove(); r.remove(); } // the model's own clips are irrelevant here
+      });
+    };
+    ctl.append(el('span', { class: 'muted', text: 'play on' }), sel, axis, el('button', { class: 'primary', type: 'button', text: '▶ Play on model', onclick: run }), status);
+    axis.addEventListener('change', () => { if (activeViewer) run(); });
+  }
+
+  /* 2D sprite animation: resolve each frame's sprite guid to its texture and cycle through them. */
+  async function renderFlipbook(a, body, pv, parsed, curve) {
+    dropViewer();
+    const keys = curve.keys.slice().sort((x, y) => x.t - y.t);
+    const guids = [...new Set(keys.map((k) => k.v.guid))];
+    const status = el('div', { class: 'muted' }, el('span', { class: 'spinner' }), ` resolving ${guids.length} sprite(s)…`);
+    body.append(status);
+    const byGuid = new Map();
+    await Promise.all(guids.map(async (g) => {
+      try { byGuid.set(g, await api(`/api/resolve?ident=${g}&package=${a.package_id}`)); }
+      catch (_) { try { byGuid.set(g, await api(`/api/resolve?ident=${g}`)); } catch (__) {} }
+    }));
+    const frames = keys.map((k) => ({ t: k.t, asset: byGuid.get(k.v.guid) || null, fileID: k.v.fileID, sub: k.v.fileID !== 21300000, rect: null }));
+    const found = frames.filter((f) => f.asset).length;
+    status.innerHTML = '';
+    if (!found) { status.textContent = 'The sprites referenced by this clip are not in the library.'; return; }
+    // Sub-sprites of a sheet: crop with the rects from the texture's .meta.
+    const sheets = new Map();
+    await Promise.all([...new Set(frames.filter((f) => f.sub && f.asset).map((f) => f.asset.id))].map(async (id) => {
+      try { const r = await fetch(`/api/assets/${id}/meta`); if (r.ok) sheets.set(id, window.UaiViewer.parseSpriteSheet(await r.text())); } catch (_) {}
+    }));
+    let uncropped = 0;
+    for (const f of frames) {
+      if (!f.sub || !f.asset) continue;
+      const sheet = sheets.get(f.asset.id);
+      f.rect = (sheet && sheet.rects.get(f.fileID)) || null;
+      if (!f.rect) uncropped++;
+    }
+    pv.innerHTML = '';
+    pv.classList.remove('viewer');
+    const canvas = el('canvas', { style: 'image-rendering: pixelated; max-width: 100%; max-height: 320px' });
+    pv.append(canvas);
+    const ctx = canvas.getContext('2d');
+    const length = Math.max(parsed.length, keys[keys.length - 1].t + 1 / (parsed.sampleRate || 60));
+    const images = new Map();
+    const imageFor = (f) => new Promise((res) => {
+      if (!f.asset) return res(null);
+      if (images.has(f.asset.id)) return res(images.get(f.asset.id));
+      const im = new Image();
+      im.onload = () => { images.set(f.asset.id, im); res(im); };
+      im.onerror = () => { images.set(f.asset.id, null); res(null); };
+      im.src = `/api/assets/${f.asset.id}/raw`;
+    });
+    await Promise.all(frames.map(imageFor));
+    // One canvas size for the whole clip so it does not jump between frames.
+    let W = 1, H = 1;
+    for (const f of frames) { const im = images.get(f.asset && f.asset.id); if (!im) continue; const r = f.rect || { width: im.width, height: im.height }; W = Math.max(W, r.width); H = Math.max(H, r.height); }
+    canvas.width = W; canvas.height = H;
+    const scale = Math.min(4, Math.floor(320 / H) || 1);
+    canvas.style.width = W * scale + 'px'; canvas.style.height = H * scale + 'px';
+    let i = -1, timer = null, playing = true;
+    const show = (n) => {
+      i = n;
+      const f = frames[n];
+      const im = images.get(f.asset && f.asset.id);
+      ctx.clearRect(0, 0, W, H);
+      if (im) {
+        if (f.rect) ctx.drawImage(im, f.rect.x, im.height - f.rect.y - f.rect.height, f.rect.width, f.rect.height, Math.floor((W - f.rect.width) / 2), H - f.rect.height, f.rect.width, f.rect.height);
+        else ctx.drawImage(im, Math.floor((W - im.width) / 2), H - im.height);
+      }
+      label.textContent = `frame ${n + 1}/${frames.length} · ${f.t.toFixed(2)}s`;
+    };
+    const step = () => {
+      if (!playing) return;
+      const n = (i + 1) % frames.length;
+      show(n);
+      const next = n + 1 < frames.length ? frames[n + 1].t : length;
+      timer = setTimeout(step, Math.max(16, (next - frames[n].t) * 1000 / speed));
+    };
+    let speed = 1;
+    const label = el('span', { class: 'muted' });
+    const bar = el('div', { class: 'viewer-bar' },
+      el('button', { class: 'ghost', type: 'button', text: '❚❚', onclick: (e) => { playing = !playing; e.target.textContent = playing ? '❚❚' : '▶'; if (playing) step(); else clearTimeout(timer); } }),
+      el('button', { class: 'ghost', type: 'button', text: '⟨', title: 'previous frame', onclick: () => { playing = false; clearTimeout(timer); show((i - 1 + frames.length) % frames.length); } }),
+      el('button', { class: 'ghost', type: 'button', text: '⟩', title: 'next frame', onclick: () => { playing = false; clearTimeout(timer); show((i + 1) % frames.length); } }),
+      el('select', { onchange: (e) => { speed = +e.target.value; } }, ...['0.25', '0.5', '1', '2'].map((v) => el('option', { value: v, text: v + '×', selected: v === '1' }))),
+      label);
+    pv.after(bar);
+    body.append(el('div', { class: 'muted', text: `${found} of ${frames.length} frames resolved · ${(frames.length / length).toFixed(1)} fps effective · ${W}×${H}px` + (uncropped ? ` · ${uncropped} sheet frame(s) without a rect are shown whole` : '') }));
+    const ul = el('ul', { class: 'list-plain' });
+    for (const g of guids) { const s = byGuid.get(g); if (s) ul.append(el('li', { onclick: () => openDetail(s.id), title: s.path }, el('span', { class: 'badge', text: s.kind }), ' ', s.name)); }
+    body.append(ul);
+    step();
   }
 
   async function renderText(a, body) {

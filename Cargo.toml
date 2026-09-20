@@ -1,6 +1,6 @@
 [package]
 name = "uai"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 rust-version = "1.85"
 description = "Index .unitypackage libraries so individual assets (and their dependencies) can be searched, previewed and extracted without importing whole packages."

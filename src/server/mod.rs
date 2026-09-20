@@ -25,6 +25,21 @@ use crate::service::{LocalService, Service};
 const INDEX_HTML: &str = include_str!("../../web/index.html");
 const APP_JS: &str = include_str!("../../web/app.js");
 const STYLE_CSS: &str = include_str!("../../web/style.css");
+const VIEWER_JS: &str = include_str!("../../web/viewer.js");
+
+/// three.js and the loaders used by the 3D preview, embedded so the UI works offline.
+const VENDOR: &[(&str, &[u8])] = &[
+    ("three.module.min.js", include_bytes!("../../web/vendor/three.module.min.js")),
+    ("three.core.min.js", include_bytes!("../../web/vendor/three.core.min.js")),
+    ("addons/loaders/FBXLoader.js", include_bytes!("../../web/vendor/addons/loaders/FBXLoader.js")),
+    ("addons/loaders/OBJLoader.js", include_bytes!("../../web/vendor/addons/loaders/OBJLoader.js")),
+    ("addons/loaders/GLTFLoader.js", include_bytes!("../../web/vendor/addons/loaders/GLTFLoader.js")),
+    ("addons/curves/NURBSCurve.js", include_bytes!("../../web/vendor/addons/curves/NURBSCurve.js")),
+    ("addons/curves/NURBSUtils.js", include_bytes!("../../web/vendor/addons/curves/NURBSUtils.js")),
+    ("addons/libs/fflate.module.js", include_bytes!("../../web/vendor/addons/libs/fflate.module.js")),
+    ("addons/utils/BufferGeometryUtils.js", include_bytes!("../../web/vendor/addons/utils/BufferGeometryUtils.js")),
+    ("addons/controls/OrbitControls.js", include_bytes!("../../web/vendor/addons/controls/OrbitControls.js")),
+];
 
 /// Raw assets served for in-browser preview are capped at this size.
 const RAW_MAX_BYTES: usize = 256 * 1024 * 1024;
@@ -93,11 +108,30 @@ async fn app_js() -> Response {
 async fn style_css() -> Response {
     static_file(STYLE_CSS, "text/css; charset=utf-8")
 }
+async fn viewer_js() -> Response {
+    static_file(VIEWER_JS, "application/javascript; charset=utf-8")
+}
+async fn vendor_file(Path(path): Path<String>) -> Response {
+    match VENDOR.iter().find(|(p, _)| *p == path) {
+        Some((_, body)) => (
+            [
+                (header::CONTENT_TYPE, HeaderValue::from_static("application/javascript; charset=utf-8")),
+                (header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=604800")),
+            ],
+            *body,
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
 
 #[derive(Deserialize, Default)]
 struct IdentQuery {
     #[serde(default)]
     ident: String,
+    /// raw: when `ident` is ambiguous, pick the candidate closest (by path) to this asset id
+    #[serde(default)]
+    near: Option<i64>,
     /// preview: also extract from the package when the thumbnail is not stored yet
     #[serde(default)]
     extract: Option<String>,
@@ -316,9 +350,44 @@ fn mime_for_ext(ext: &str) -> &'static str {
     }
 }
 
-async fn raw_response(st: &Shared, ident: String) -> ApiResult<Response> {
+fn common_prefix(a: &str, b: &str) -> usize {
+    a.split('/').zip(b.split('/')).take_while(|(x, y)| x == y).count()
+}
+
+/// Resolve `ident`; if it is ambiguous and `near` is given, take the candidate whose path shares the
+/// longest prefix with that asset (textures referenced by a model live next to it).
+fn resolve_near(s: &LocalService, ident: &str, near: Option<i64>) -> Result<Asset> {
+    match s.resolve(ident, None) {
+        Ok(a) => Ok(a),
+        Err(e) => {
+            let Some(near_id) = near else { return Err(e) };
+            let Some(UaiError::Ambiguous { candidates, .. }) = e.downcast_ref::<UaiError>() else { return Err(e) };
+            let Some(anchor) = s.db.asset_by_id(near_id)? else { return Err(e) };
+            let best = candidates
+                .iter()
+                .filter(|c| c.package_id == anchor.package_id)
+                .max_by_key(|c| common_prefix(&c.path, &anchor.path))
+                .or_else(|| candidates.first())
+                .cloned();
+            best.ok_or(e)
+        }
+    }
+}
+
+async fn api_meta(State(st): State<Shared>, Path(id): Path<i64>) -> ApiResult<Response> {
+    let text = with_svc(&st, move |s| {
+        let asset = s.resolve(&format!("#{id}"), None)?;
+        let (bytes, _) = exporter::read_member(&s.cfg, &s.db, &asset, "asset.meta", 8 << 20)?
+            .ok_or_else(|| UaiError::NotFound("asset.meta not found in package".to_string()))?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    })
+    .await?;
+    Ok(([(header::CONTENT_TYPE, HeaderValue::from_static("text/plain; charset=utf-8"))], text).into_response())
+}
+
+async fn raw_response(st: &Shared, ident: String, near: Option<i64>) -> ApiResult<Response> {
     let (asset, bytes, truncated) = with_svc(st, move |s| {
-        let asset = s.resolve(&ident, None)?;
+        let asset = resolve_near(s, &ident, near)?;
         let (bytes, truncated) = s.raw_for(&asset, RAW_MAX_BYTES)?.ok_or_else(|| {
             UaiError::NotFound("asset not found in package (index stale? run `uai index`)".to_string())
         })?;
@@ -349,11 +418,11 @@ async fn api_raw(State(st): State<Shared>, Query(q): Query<IdentQuery>) -> ApiRe
         Some(p) if !q.ident.contains("::") => format!("{p}::{}", q.ident),
         _ => q.ident,
     };
-    raw_response(&st, ident).await
+    raw_response(&st, ident, q.near).await
 }
 
 async fn api_raw_by_id(State(st): State<Shared>, Path(id): Path<i64>) -> ApiResult<Response> {
-    raw_response(&st, format!("#{id}")).await
+    raw_response(&st, format!("#{id}"), None).await
 }
 
 async fn api_export_plan(State(st): State<Shared>, Json(req): Json<ExportRequest>) -> ApiResult<Json<PlanOut>> {
@@ -413,6 +482,8 @@ pub fn router(cfg: Config) -> Router {
         .route("/", get(index_html))
         .route("/app.js", get(app_js))
         .route("/style.css", get(style_css))
+        .route("/viewer.js", get(viewer_js))
+        .route("/vendor/{*path}", get(vendor_file))
         .route("/api/stats", get(api_stats))
         .route("/api/packages", get(api_packages))
         .route("/api/package", get(api_package))
@@ -430,6 +501,7 @@ pub fn router(cfg: Config) -> Router {
         .route("/api/assets/{id}", get(api_asset_by_id))
         .route("/api/assets/{id}/preview.png", get(api_preview_by_id))
         .route("/api/assets/{id}/raw", get(api_raw_by_id))
+        .route("/api/assets/{id}/meta", get(api_meta))
         .route("/api/export/plan", post(api_export_plan))
         .route("/api/export/unitypackage", post(api_export_unitypackage))
         .layer(tower_http::cors::CorsLayer::permissive())

@@ -115,6 +115,18 @@ grid, a package browser, an asset panel with the dependency tree, reverse depend
 of YAML / script assets, in-browser viewing of textures and playback of audio clips, and an export
 basket that downloads a slim `.unitypackage` (dependencies resolved) for drag-and-drop into Unity.
 
+Previews go further than thumbnails:
+
+* **3D models** (FBX, OBJ, glTF): "View in 3D" renders the file with three.js (embedded in the
+  binary, works offline), textures resolved from the same package, orbit/zoom, and a clip selector
+  for animations embedded in the FBX.
+* **`.anim` clips**: the Animation tab shows length, frame rate, wrap mode and the bound curves.
+  Generic clips (transform curves per bone path) can be played on any FBX from the same package,
+  matched by bone name (approximate: keys only, Unity's X-mirror undone, switchable). 2D sprite
+  clips play as a flipbook, cropping sub-sprites with the rects from the texture's `.meta`.
+  Humanoid clips are muscle curves that need Unity's retargeter; the tab lists the package's source
+  FBX files that usually carry the same animation.
+
 The JSON API behind it (`/api/search`, `/api/assets/{id}`, `/api/deps`, `/api/export/plan`,
 `/api/export/unitypackage`, ...) is what remote mode and the UI use; responses have the same shape
 as the CLI's `--json` output.
