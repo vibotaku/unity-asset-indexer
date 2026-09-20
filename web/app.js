@@ -86,8 +86,18 @@
     toastTimer = setTimeout(() => t.classList.add('hidden'), err ? 6000 : 2800);
   }
 
+  // Every request in flight lights the progress bar under the header.
+  let inflight = 0;
+  function busy(delta) {
+    inflight = Math.max(0, inflight + delta);
+    $('progress').classList.toggle('active', inflight > 0);
+  }
+  async function tracked(promise) {
+    busy(1);
+    try { return await promise; } finally { busy(-1); }
+  }
   async function api(path, opts) {
-    const r = await fetch(path, opts);
+    const r = await tracked(fetch(path, opts));
     if (!r.ok) {
       let msg = `HTTP ${r.status}`;
       try { const j = await r.json(); msg = j.error || msg; } catch (_) {}
@@ -187,9 +197,13 @@
     $('more').classList.add('hidden');
     $('empty').classList.add('hidden');
     if (!append) $('grid').innerHTML = '<div class="muted"><span class="spinner"></span> searching…</div>';
+    else $('more').innerHTML = '<span class="spinner"></span> loading…';
+    $('results').classList.add('busy');
     let rows;
     try { rows = await api('/api/search?' + p); } catch (e) { toast(e.message, true); rows = []; }
     if (seq !== searchSeq) return;
+    $('results').classList.remove('busy');
+    $('more').textContent = 'Load more';
     state.results = append ? state.results.concat(rows) : rows;
     state.offset += rows.length;
     renderResults();
@@ -212,7 +226,10 @@
     const box = el('div', { class: big ? 'preview-box' : 'thumb' });
     if (a.has_preview) {
       const img = el('img', { loading: 'lazy', alt: '', src: `/api/assets/${a.id}/preview.png` });
-      img.addEventListener('error', () => { img.replaceWith(el('span', { class: 'ph', text: KIND_ICON[a.kind] || '•' })); });
+      box.classList.add('loading');
+      img.addEventListener('load', () => box.classList.remove('loading'));
+      img.addEventListener('error', () => { box.classList.remove('loading'); img.replaceWith(el('span', { class: 'ph', text: KIND_ICON[a.kind] || '•' })); });
+      if (img.complete && img.naturalWidth) box.classList.remove('loading');
       box.append(img);
     } else {
       box.append(el('span', { class: 'ph', text: KIND_ICON[a.kind] || '•' }));
@@ -655,7 +672,7 @@
     const old = btn.textContent;
     btn.innerHTML = '<span class="spinner"></span> building…';
     try {
-      const r = await fetch('/api/export/unitypackage', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(exportRequest()) });
+      const r = await tracked(fetch('/api/export/unitypackage', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(exportRequest()) }));
       if (!r.ok) { let m = `HTTP ${r.status}`; try { m = (await r.json()).error || m; } catch (_) {} throw new Error(m); }
       const cd = r.headers.get('content-disposition') || '';
       const m = /filename="([^"]+)"/.exec(cd);
@@ -697,9 +714,12 @@
     readHash();
     setView(state.view);
     renderBasket();
-    try { await loadMeta(); } catch (e) { toast('Cannot reach the server: ' + e.message, true); }
+    const overlay = $('loadingOverlay');
+    try { await loadMeta(); } catch (e) { overlay.querySelector('.loading-text').textContent = 'Cannot reach the server: ' + e.message; toast('Cannot reach the server: ' + e.message, true); }
     if (state.package && !state.q) { const p = state.packages.find((x) => String(x.id) === state.package); if (p) state.browsing = { pkg: p, prefix: 'Assets' }; }
     await search();
+    overlay.classList.add('fade');
+    setTimeout(() => overlay.remove(), 300);
     if (state.detailId) openDetail(state.detailId);
   })();
 })();
