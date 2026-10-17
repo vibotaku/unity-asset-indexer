@@ -5,7 +5,7 @@ description: Find and pull individual assets (prefabs, models, textures, materia
 
 # Unity asset library (`uai`)
 
-The team's purchased Unity packages live on an SMB share and are indexed by `uai`
+The team's purchased Unity packages are indexed by `uai`
 (https://github.com/vibotaku/unity-asset-indexer, a single native binary). It can search every asset
 inside every `.unitypackage`, compute the full dependency closure, and write just those files into a
 project's `Assets/` folder with `.meta` files, so guid references stay valid.
@@ -19,6 +19,14 @@ Two ways to run it:
 * **Remote**: a teammate runs `uai serve`; use `uai --server http://host:7878 ...` (or
   `uai config --set-server URL` once, or `UAI_SERVER`). Everything below works the same, exports are
   streamed from the server. No share, no index needed on this machine.
+
+## Important consideration
+
+  * For full ui kit package from Synty, Layer lab etc. The projects should import the whole package rather than
+    only importing pieces of the ui from unity asset indexer, agent should follow the prefab structure in these 
+    ui kit as much as possible to maintain ui/ux consistency.
+    
+  * For asset packages such as audio fx library, it's recommended to take what you need from unity asset indexer.
 
 ## Workflow
 
@@ -70,6 +78,7 @@ Two ways to run it:
 file name, or `#<id>` from `--json` output. If a name is ambiguous the command exits with the
 candidate list; pick the guid.
 
+    
 ## Gotchas
 
 * Exports from very large packages (multi-GB audio bundles) re-stream the whole package and can take
