@@ -9,7 +9,7 @@
 pub mod auth;
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use axum::body::{Body, Bytes};
@@ -25,6 +25,7 @@ use tokio_util::io::ReaderStream;
 use crate::config::Config;
 use crate::error::UaiError;
 use crate::exporter;
+use crate::indexer::{index_library_locked, IndexLock, IndexOptions};
 use crate::model::*;
 use crate::service::{LocalService, Service};
 use auth::{Auth, AuthConfig, Denied, Principal};
@@ -55,6 +56,8 @@ struct AppState {
     cfg: Config,
     /// `None` when the server runs open (no tokens or Google accounts configured).
     auth: Option<Arc<Auth>>,
+    /// The latest index run started through `POST /api/index`.
+    index: Mutex<IndexStatus>,
 }
 
 type Shared = Arc<AppState>;
@@ -568,11 +571,23 @@ struct AuthStatus {
     required: bool,
     methods: Vec<&'static str>,
     user: Option<String>,
+    /// OAuth client id for the "Sign in with Google" button, when configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    google_client_id: Option<String>,
+    /// Hosted-domain hint for the Google account chooser (when exactly one domain is allowed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    google_hd: Option<String>,
 }
 
 async fn api_auth(State(state): State<Shared>, headers: HeaderMap) -> Json<AuthStatus> {
     let Some(auth) = state.auth.clone() else {
-        return Json(AuthStatus { required: false, methods: vec![], user: None });
+        return Json(AuthStatus {
+            required: false,
+            methods: vec![],
+            user: None,
+            google_client_id: None,
+            google_hd: None,
+        });
     };
     let mut methods = vec![];
     if !auth.config().tokens.is_empty() {
@@ -582,7 +597,18 @@ async fn api_auth(State(state): State<Shared>, headers: HeaderMap) -> Json<AuthS
         methods.push("google");
     }
     let user = authenticate(&auth, &headers).await.ok().map(|p| p.0);
-    Json(AuthStatus { required: true, methods, user })
+    let cfg = auth.config();
+    let google_hd = match cfg.google_domains.as_slice() {
+        [only] => Some(only.clone()),
+        _ => None,
+    };
+    Json(AuthStatus {
+        required: true,
+        methods,
+        user,
+        google_client_id: cfg.web_client_id().map(str::to_string),
+        google_hd: google_hd.filter(|_| cfg.web_client_id().is_some()),
+    })
 }
 
 #[derive(Deserialize, Default)]
@@ -642,13 +668,100 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
+// ----- index runs ---------------------------------------------------------------------------------
+
+/// How many of a run's log lines `GET /api/index` keeps.
+const INDEX_LOG_TAIL: usize = 200;
+
+async fn api_index_status(State(state): State<Shared>) -> Json<IndexStatus> {
+    Json(state.index.lock().unwrap().clone())
+}
+
+/// Start an incremental index run in the background, so packages added to the library show up
+/// without restarting the server. 423 while a run is going, here or in another process.
+async fn api_index_start(State(state): State<Shared>, req: Request) -> ApiResult<(StatusCode, Json<IndexStatus>)> {
+    let who = req.extensions().get::<Principal>().map(|p| p.0.clone());
+    let body = axum::body::to_bytes(req.into_body(), 64 * 1024).await.unwrap_or_default();
+    let body: IndexRequest = if body.is_empty() {
+        IndexRequest::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|e| ApiErr(UaiError::Invalid(format!("bad request body: {e}")).into()))?
+    };
+    let only = body.only.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    if body.force && only.is_none() {
+        return Err(ApiErr(
+            UaiError::Invalid(
+                "a forced re-index through the API needs `only`; run a full one on the server itself".into(),
+            )
+            .into(),
+        ));
+    }
+    let lock = IndexLock::try_acquire(&state.cfg).map_err(ApiErr)?;
+    let status = {
+        let mut s = state.index.lock().unwrap();
+        *s = IndexStatus {
+            run: s.run + 1,
+            running: true,
+            started_by: who,
+            started_at: Some(auth::now_secs() as f64),
+            only: only.clone(),
+            force: body.force,
+            ..Default::default()
+        };
+        s.clone()
+    };
+    eprintln!(
+        "index run {} started by {}{}",
+        status.run,
+        status.started_by.as_deref().unwrap_or("anonymous"),
+        only.as_deref().map(|o| format!(" (only {o:?})")).unwrap_or_default()
+    );
+    let st = state.clone();
+    let opts = IndexOptions { force: body.force, only, ..Default::default() };
+    tokio::task::spawn_blocking(move || run_index(st, lock, opts));
+    Ok((StatusCode::ACCEPTED, Json(status)))
+}
+
+fn run_index(state: Shared, lock: IndexLock, opts: IndexOptions) {
+    let result = LocalService::open(&state.cfg).and_then(|mut svc| {
+        let mut log = |line: &str| {
+            let mut s = state.index.lock().unwrap();
+            s.log_total += 1;
+            s.log.push(line.to_string());
+            if s.log.len() > INDEX_LOG_TAIL {
+                s.log.remove(0);
+            }
+        };
+        let mut progress = |line: &str| state.index.lock().unwrap().progress = Some(line.to_string());
+        index_library_locked(&lock, &state.cfg, &mut svc.db, &opts, &mut log, Some(&mut progress))
+    });
+    drop(lock);
+    let mut s = state.index.lock().unwrap();
+    s.running = false;
+    s.finished_at = Some(auth::now_secs() as f64);
+    match result {
+        Ok(r) => {
+            eprintln!(
+                "index run {}: {} indexed, {} up to date, {} errors in {:.0}s",
+                s.run, r.indexed, r.skipped, r.errors, r.seconds
+            );
+            s.report = Some(r);
+        }
+        Err(e) => {
+            eprintln!("index run {} failed: {e:#}", s.run);
+            s.error = Some(format!("{e:#}"));
+        }
+    }
+}
+
 /// The API and UI without auth (LAN use, tests).
 pub fn router(cfg: Config) -> Router {
     router_with_auth(cfg, None)
 }
 
 pub fn router_with_auth(cfg: Config, auth: Option<Arc<Auth>>) -> Router {
-    let state: Shared = Arc::new(AppState { cfg, auth: auth.filter(|a| a.enabled()) });
+    let state: Shared =
+        Arc::new(AppState { cfg, auth: auth.filter(|a| a.enabled()), index: Mutex::new(IndexStatus::default()) });
     Router::new()
         .route("/", get(index_html))
         .route("/app.js", get(app_js))
@@ -675,6 +788,7 @@ pub fn router_with_auth(cfg: Config, auth: Option<Arc<Auth>>) -> Router {
         .route("/api/assets/{id}/meta", get(api_meta))
         .route("/api/export/plan", post(api_export_plan))
         .route("/api/export/unitypackage", post(api_export_unitypackage))
+        .route("/api/index", get(api_index_status).post(api_index_start))
         .route("/healthz", get(healthz))
         .route("/api/auth", get(api_auth))
         .route("/api/login", post(api_login))

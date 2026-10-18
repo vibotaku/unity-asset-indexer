@@ -12,6 +12,7 @@ use walkdir::WalkDir;
 
 use crate::config::Config;
 use crate::db::Database;
+use crate::error::UaiError;
 use crate::model::IndexReport;
 use crate::unitypackage::{read_package_header, scan_package, Entry, ScanOptions};
 
@@ -98,9 +99,48 @@ fn mtime_secs(md: &std::fs::Metadata) -> f64 {
         .unwrap_or(0.0)
 }
 
+/// Held for the whole of an index run (`<home>/index.lock`), so a second run — the server's
+/// `/api/index`, an hourly timer, a manual `uai index` — fails fast instead of scanning the same
+/// packages twice. The OS drops the lock when the process exits, so a crash leaves nothing stale.
+pub struct IndexLock {
+    _file: std::fs::File,
+}
+
+impl IndexLock {
+    pub fn try_acquire(cfg: &Config) -> Result<IndexLock> {
+        let path = cfg.home.join("index.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .map_err(|e| anyhow::anyhow!("opening {}: {e}", path.display()))?;
+        match file.try_lock() {
+            Ok(()) => Ok(IndexLock { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                Err(UaiError::Busy("another index run is in progress; try again when it is done".into()).into())
+            }
+            Err(std::fs::TryLockError::Error(e)) => bail!("locking {}: {e}", path.display()),
+        }
+    }
+}
+
 /// Index the library. `log` gets one line per finished package; `progress` (optional) gets a
 /// periodically refreshed status line (bytes read, throughput, ETA).
 pub fn index_library(
+    cfg: &Config,
+    db: &mut Database,
+    opts: &IndexOptions,
+    log: &mut dyn FnMut(&str),
+    progress: Option<&mut dyn FnMut(&str)>,
+) -> Result<IndexReport> {
+    let lock = IndexLock::try_acquire(cfg)?;
+    index_library_locked(&lock, cfg, db, opts, log, progress)
+}
+
+/// [`index_library`] for a caller that already holds the [`IndexLock`].
+pub fn index_library_locked(
+    _lock: &IndexLock,
     cfg: &Config,
     db: &mut Database,
     opts: &IndexOptions,

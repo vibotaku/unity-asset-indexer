@@ -45,6 +45,9 @@ pub struct AuthConfig {
     pub google_emails: Vec<String>,
     /// Accepted `aud` values; empty means [`GCLOUD_CLIENT_ID`].
     pub google_audiences: Vec<String>,
+    /// OAuth client id (web application) for "Sign in with Google" on the web UI. Tokens from that
+    /// button carry it as `aud`, so it is accepted in addition to `google_audiences`.
+    pub google_client_id: Option<String>,
     /// Lifetime of a web UI session cookie.
     pub session_hours: u64,
 }
@@ -68,6 +71,9 @@ impl AuthConfig {
             let who: Vec<String> =
                 self.google_domains.iter().map(|d| format!("@{d}")).chain(self.google_emails.iter().cloned()).collect();
             parts.push(format!("Google accounts {}", who.join(", ")));
+            if self.web_client_id().is_some() {
+                parts.push("Sign in with Google on the web UI".into());
+            }
         }
         if parts.is_empty() {
             "none".into()
@@ -76,12 +82,19 @@ impl AuthConfig {
         }
     }
 
+    /// The web UI's OAuth client id, when Google accounts are accepted at all.
+    pub fn web_client_id(&self) -> Option<&str> {
+        self.google_client_id.as_deref().map(str::trim).filter(|s| !s.is_empty() && self.google_enabled())
+    }
+
     fn audiences(&self) -> Vec<&str> {
-        if self.google_audiences.is_empty() {
+        let mut auds: Vec<&str> = if self.google_audiences.is_empty() {
             vec![GCLOUD_CLIENT_ID]
         } else {
             self.google_audiences.iter().map(|s| s.as_str()).collect()
-        }
+        };
+        auds.extend(self.web_client_id());
+        auds
     }
 }
 
@@ -555,6 +568,17 @@ mod tests {
         let mut c = ok.clone();
         c["aud"] = "my-aud".into();
         assert!(custom.check_bearer(&jwt(header(), c)).is_ok());
+
+        // The web UI's client id is accepted on top of the gcloud default, not instead of it.
+        let web = auth(AuthConfig { google_client_id: Some("web.apps.googleusercontent.com".into()), ..google_cfg() });
+        assert!(web.check_bearer(&good).is_ok());
+        let mut c = ok.clone();
+        c["aud"] = "web.apps.googleusercontent.com".into();
+        assert!(web.check_bearer(&jwt(header(), c)).is_ok());
+        // Without Google accounts configured there is no web sign-in.
+        let tokens_only =
+            AuthConfig { tokens: vec!["t".into()], google_client_id: Some("x".into()), ..Default::default() };
+        assert_eq!(tokens_only.web_client_id(), None);
     }
 
     #[test]

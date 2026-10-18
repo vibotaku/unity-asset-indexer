@@ -93,7 +93,8 @@ enum Cmd {
         #[command(flatten)]
         json: JsonFlag,
     },
-    /// (Re)index the library; incremental by size+mtime
+    /// (Re)index the library; incremental by size+mtime. With a server configured, the server
+    /// indexes its own library and this follows the run
     Index {
         #[arg(long)]
         workers: Option<usize>,
@@ -106,6 +107,12 @@ enum Cmd {
         /// Do not store preview thumbnails
         #[arg(long)]
         no_previews: bool,
+        /// With a server: start the run there and return instead of following it
+        #[arg(long)]
+        no_wait: bool,
+        /// With a server: show its latest index run instead of starting one
+        #[arg(long, conflicts_with_all = ["force", "only", "no_wait", "workers", "no_previews"])]
+        status: bool,
         #[command(flatten)]
         json: JsonFlag,
     },
@@ -298,6 +305,10 @@ enum Cmd {
         /// `gcloud auth print-identity-token` uses for user accounts)
         #[arg(long = "google-audience", value_name = "AUD", env = "UAI_GOOGLE_AUDIENCES", value_delimiter = ',')]
         google_audiences: Vec<String>,
+        /// OAuth client id (web application) that turns on "Sign in with Google" in the web UI; its
+        /// authorized JavaScript origins must include this server's URL
+        #[arg(long, value_name = "CLIENT_ID", env = "UAI_GOOGLE_CLIENT_ID")]
+        google_client_id: Option<String>,
         /// How long a web UI sign-in lasts
         #[arg(long, value_name = "HOURS", default_value_t = 12)]
         session_hours: u64,
@@ -373,9 +384,26 @@ fn run(cli: Cli) -> Result<()> {
             }
             cmd_config(cfg, set_library, add_library, remove_library, set_server, clear_server, json.json)
         }
-        Cmd::Index { workers, force, only, no_previews, json } => {
-            cmd_index(&cfg, workers, force, only, !no_previews, json.json)
-        }
+        Cmd::Index { workers, force, only, no_previews, no_wait, status, json } => match &cfg.server {
+            Some(server) if status => {
+                let s = uai::client::RemoteService::new(server, cfg.auth.clone())?.index_status()?;
+                if json.json {
+                    return out_json(&s);
+                }
+                print_index_status(&s);
+                Ok(())
+            }
+            None if status => {
+                bail!("--status shows a server's index run; set --server (a local run prints as it goes)")
+            }
+            Some(server) => {
+                if workers.is_some() || no_previews {
+                    bail!("--workers and --no-previews only apply to a local index; the server picks its own");
+                }
+                cmd_index_remote(&cfg, server, IndexRequest { only, force }, !no_wait, json.json)
+            }
+            None => cmd_index(&cfg, workers, force, only, !no_previews, json.json),
+        },
         Cmd::Packages { json } => cmd_packages(&*open_service(&cfg)?, json.json),
         Cmd::Search { query, kind, ext, package, publisher, limit, folders, json } => {
             let q = SearchQuery {
@@ -463,6 +491,7 @@ fn run(cli: Cli) -> Result<()> {
             google_domains,
             google_emails,
             google_audiences,
+            google_client_id,
             session_hours,
         } => {
             if let Some(f) = auth_token_file {
@@ -476,6 +505,7 @@ fn run(cli: Cli) -> Result<()> {
                 google_domains,
                 google_emails,
                 google_audiences,
+                google_client_id,
                 session_hours,
             };
             uai::server::serve(cfg, &bind, open, auth)
@@ -602,9 +632,6 @@ fn cmd_index(
     previews: bool,
     json: bool,
 ) -> Result<()> {
-    if cfg.server.is_some() {
-        bail!("`uai index` runs on the machine that has the library; drop --server (or use --local)");
-    }
     let mut svc = LocalService::open(cfg)?;
     let mut opts = IndexOptions { force, only, previews, ..Default::default() };
     if let Some(w) = workers {
@@ -636,11 +663,90 @@ fn cmd_index(
     if json {
         return out_json(&res);
     }
+    print_index_done(&res);
+    Ok(())
+}
+
+fn print_index_status(s: &IndexStatus) {
+    if s.run == 0 {
+        println!("no index run started through this server since it started");
+        return;
+    }
+    let who = s.started_by.as_deref().unwrap_or("anonymous");
+    let only = s.only.as_deref().map(|o| format!(", only {o:?}")).unwrap_or_default();
+    println!("index run {} (started by {who}{only})", s.run);
+    if s.running {
+        println!("  running: {}", s.progress.as_deref().unwrap_or("starting"));
+    } else if let Some(e) = &s.error {
+        println!("  failed: {e}");
+    } else if let Some(r) = &s.report {
+        print!("  ");
+        print_index_done(r);
+    }
+}
+
+fn print_index_done(res: &IndexReport) {
     println!(
         "done: {} indexed, {} up to date, {} errors, {} assets, {} previews in {:.0}s",
         res.indexed, res.skipped, res.errors, res.entries, res.previews, res.seconds
     );
-    Ok(())
+}
+
+/// `uai index` against a server: the server indexes its own library (`POST /api/index`); this
+/// follows the run's log until it ends.
+fn cmd_index_remote(cfg: &Config, server: &str, req: IndexRequest, wait: bool, json: bool) -> Result<()> {
+    let remote = uai::client::RemoteService::new(server, cfg.auth.clone())?;
+    let started = remote.start_index(&req)?;
+    if !wait {
+        if json {
+            return out_json(&started);
+        }
+        println!("index run {} started on {server}; check on it with `uai index --status`", started.run);
+        return Ok(());
+    }
+    if !json {
+        eprintln!("index run {} started on {server}", started.run);
+    }
+    let is_tty = std::io::stderr().is_terminal();
+    let mut printed = 0usize;
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        let s = remote.index_status()?;
+        if s.run != started.run {
+            bail!("the server has started another index run ({}) since ours ({})", s.run, started.run);
+        }
+        if !json {
+            let first = s.log_total - s.log.len();
+            if is_tty && s.log_total > printed {
+                eprint!("\r\x1b[K");
+            }
+            for line in s.log.iter().skip(printed.saturating_sub(first)) {
+                println!("{line}");
+            }
+            printed = s.log_total;
+            if is_tty && s.running {
+                if let Some(p) = &s.progress {
+                    eprint!("\r\x1b[K  {p}");
+                    let _ = std::io::stderr().flush();
+                }
+            }
+        }
+        if !s.running {
+            if is_tty && !json {
+                eprint!("\r\x1b[K");
+            }
+            if json {
+                return out_json(&s);
+            }
+            if let Some(e) = s.error {
+                bail!("index run {} on the server failed: {e}", s.run);
+            }
+            if let Some(r) = &s.report {
+                print_index_done(r);
+            }
+            return Ok(());
+        }
+    }
 }
 
 fn cmd_packages(svc: &dyn Service, json: bool) -> Result<()> {

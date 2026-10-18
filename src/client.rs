@@ -174,6 +174,16 @@ impl RemoteService {
         vec![("package", package.unwrap_or("").to_string())]
     }
 
+    /// Start an incremental index run on the server (`uai index` in remote mode).
+    pub fn start_index(&self, req: &IndexRequest) -> Result<IndexStatus> {
+        self.post_json("/api/index", req)
+    }
+
+    /// The server's latest index run.
+    pub fn index_status(&self) -> Result<IndexStatus> {
+        self.get_json("/api/index", &[])
+    }
+
     /// The web UI's address; for a protected server, with a one-time sign-in code (`uai web`).
     pub fn web_url(&self) -> Result<String> {
         let status: serde_json::Value = self.get_json("/api/auth", &[])?;

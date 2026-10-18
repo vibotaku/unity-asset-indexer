@@ -544,6 +544,84 @@ fn protected_server_tokens_sessions_and_tickets() {
 }
 
 #[test]
+fn server_index_api_picks_up_new_packages() {
+    use uai::error::UaiError;
+    use uai::model::{IndexRequest, IndexStatus};
+
+    let f = fixture();
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+    let listener = rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = uai::server::router(f.cfg.clone());
+    let handle = rt.spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let remote = uai::client::RemoteService::new(&base, Default::default()).unwrap();
+    assert_eq!(remote.index_status().unwrap().run, 0);
+
+    // A package lands in the library after the server started; one API call indexes it.
+    make_package(
+        &f.lib.join("Pub B/Hit Sounds.unitypackage"),
+        &[E {
+            guid: "dddddddddddddddddddddddddddddd02",
+            path: "Assets/Sfx/hit.wav",
+            asset: Some(b"RIFF".to_vec()),
+            meta: meta("dddddddddddddddddddddddddddddd02", "AudioImporter", false),
+            preview: false,
+        }],
+        None,
+    );
+    let wait = |run: u64| -> IndexStatus {
+        for _ in 0..200 {
+            let s = remote.index_status().unwrap();
+            if s.run == run && !s.running {
+                return s;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        panic!("index run {run} did not finish");
+    };
+    let started = remote.start_index(&IndexRequest::default()).unwrap();
+    assert_eq!(started.run, 1);
+    let done = wait(1);
+    assert_eq!(done.error, None);
+    let report = done.report.unwrap();
+    assert_eq!((report.indexed, report.skipped, report.errors), (1, 2, 0), "{report:?}");
+    assert!(done.log.iter().any(|l| l.contains("Hit Sounds")), "{:?}", done.log);
+    assert_eq!(remote.packages().unwrap().len(), 3);
+    assert_eq!(remote.resolve("hit.wav", None).unwrap().guid, "dddddddddddddddddddddddddddddd02");
+
+    // Nothing new: the next run only checks sizes and mtimes.
+    remote.start_index(&IndexRequest::default()).unwrap();
+    let report = wait(2).report.unwrap();
+    assert_eq!((report.indexed, report.skipped), (0, 3));
+
+    // While another process holds the index lock (the hourly timer), the API says busy.
+    let lock = uai::indexer::IndexLock::try_acquire(&f.cfg).unwrap();
+    let err = remote.start_index(&IndexRequest::default()).unwrap_err();
+    assert!(matches!(err.downcast_ref::<UaiError>(), Some(UaiError::Busy(_))), "{err:#}");
+    drop(lock);
+
+    // A forced run must name its package; a full forced re-index is for the server's own shell.
+    let err = remote.start_index(&IndexRequest { only: None, force: true }).unwrap_err();
+    assert!(matches!(err.downcast_ref::<UaiError>(), Some(UaiError::Invalid(_))), "{err:#}");
+    remote.start_index(&IndexRequest { only: Some("hit sounds".into()), force: true }).unwrap();
+    let report = wait(3).report.unwrap();
+    assert_eq!(report.indexed, 1);
+    handle.abort();
+}
+
+#[test]
+fn index_lock_is_exclusive() {
+    let f = fixture();
+    let lock = uai::indexer::IndexLock::try_acquire(&f.cfg).unwrap();
+    let mut db = Database::open_with_previews(&f.cfg.db_path(), &f.cfg.previews_path()).unwrap();
+    let mut log = |_: &str| {};
+    let err = index_library(&f.cfg, &mut db, &IndexOptions::default(), &mut log, None).unwrap_err();
+    assert!(matches!(err.downcast_ref::<uai::error::UaiError>(), Some(uai::error::UaiError::Busy(_))));
+    drop(lock);
+    assert!(index_library(&f.cfg, &mut db, &IndexOptions::default(), &mut log, None).is_ok());
+}
+
+#[test]
 fn client_auth_resolution() {
     use uai::config::ClientAuth;
     assert_eq!(ClientAuth::resolve(None, None).unwrap(), ClientAuth::None);

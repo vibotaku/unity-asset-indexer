@@ -84,6 +84,10 @@ candidate list; pick the guid.
     
 ## Gotchas
 
+* New packages copied into the library show up after `uai index` (against a server it indexes on
+  the server and prints the run; `uai index --status` shows the latest run). A package missing from
+  `uai packages` usually just needs that.
+
 * Exports from very large packages (multi-GB audio bundles) re-stream the whole package and can take
   minutes over SMB. `uai cache add "<package>"` once (on the machine with the share) makes later
   exports instant.
