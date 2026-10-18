@@ -1,8 +1,8 @@
 //! Settings: where the library roots are, where the index lives, and (optionally) which server to
 //! talk to.
 //!
-//! Precedence: explicit flags > environment (`UAI_LIBRARY`, `UAI_HOME`, `UAI_SERVER`) > `config.json`
-//! in the home directory > defaults. `UAI_LIBRARY` and `--library` may list several roots
+//! Precedence: explicit flags > environment (`UAI_LIBRARY`, `UAI_HOME`, `UAI_SERVER`, `UAI_TOKEN`,
+//! `UAI_AUTH`) > `config.json` in the home directory > defaults. `UAI_LIBRARY` and `--library` may list several roots
 //! (`--library` repeated, or the platform path-list separator in the variable).
 
 use std::fs;
@@ -28,6 +28,49 @@ pub struct ConfigFile {
     /// Where `uai cache add` extracts packages (default: `<home>/cache`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_dir: Option<String>,
+    /// Remote-mode auth: `token`, `google` or `none` (see [`ClientAuth`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<String>,
+    /// Bearer token for a protected server (the file is then kept private: mode 0600).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+}
+
+/// How remote mode authenticates to a `uai serve` started with `--auth-token` / `--google-domain`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ClientAuth {
+    #[default]
+    None,
+    /// Sent as `Authorization: Bearer`: a shared token, or any credential minted elsewhere (e.g. a
+    /// service account's ID token).
+    Token(String),
+    /// A Google ID token from `gcloud auth print-identity-token`, renewed before it expires.
+    Google,
+}
+
+impl ClientAuth {
+    pub fn label(&self) -> &'static str {
+        match self {
+            ClientAuth::None => "none",
+            ClientAuth::Token(_) => "token",
+            ClientAuth::Google => "google",
+        }
+    }
+
+    /// `mode` and `token` are the first of flag / environment / config file that is set. A token on
+    /// its own means token auth.
+    pub fn resolve(mode: Option<&str>, token: Option<&str>) -> Result<ClientAuth> {
+        let token = token.map(str::trim).filter(|t| !t.is_empty()).map(str::to_string);
+        match mode.map(|m| m.trim().to_ascii_lowercase()).filter(|m| !m.is_empty()).as_deref() {
+            None => Ok(token.map(ClientAuth::Token).unwrap_or_default()),
+            Some("none") => Ok(ClientAuth::None),
+            Some("google") | Some("gcloud") => Ok(ClientAuth::Google),
+            Some("token") => token.map(ClientAuth::Token).ok_or_else(|| {
+                anyhow::anyhow!("auth mode `token` needs a token (--token, UAI_TOKEN or config --set-token)")
+            }),
+            Some(other) => anyhow::bail!("unknown auth mode {other:?} (use token, google or none)"),
+        }
+    }
 }
 
 impl ConfigFile {
@@ -50,6 +93,8 @@ pub struct Config {
     pub server: Option<String>,
     /// Extracted-package cache location; `None` means `<home>/cache`.
     pub cache_dir: Option<PathBuf>,
+    /// How remote mode authenticates to the server.
+    pub auth: ClientAuth,
 }
 
 impl Config {
@@ -87,15 +132,25 @@ impl Config {
 
     fn write_file(path: &Path, data: &ConfigFile) -> Result<()> {
         let s = serde_json::to_string_pretty(data)? + "\n";
-        fs::write(path, s).with_context(|| format!("writing {}", path.display()))
+        fs::write(path, s).with_context(|| format!("writing {}", path.display()))?;
+        #[cfg(unix)]
+        if data.token.is_some() {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("restricting {}", path.display()))?;
+        }
+        Ok(())
     }
 
-    /// Resolve settings. `libraries`, `home` and `server` are explicit overrides (flags).
+    /// Resolve settings. `libraries`, `home`, `server`, `cache_dir`, `auth` and `token` are explicit
+    /// overrides (flags).
     pub fn load(
         libraries: &[String],
         home: Option<&str>,
         server: Option<&str>,
         cache_dir: Option<&str>,
+        auth: Option<&str>,
+        token: Option<&str>,
     ) -> Result<Config> {
         let home_dir = home
             .map(|s| s.to_string())
@@ -132,13 +187,20 @@ impl Config {
             .or_else(|| data.cache_dir.clone())
             .filter(|s| !s.trim().is_empty())
             .map(|s| expand_tilde(s.trim()));
+        let env = |k: &str| std::env::var(k).ok().filter(|s| !s.trim().is_empty());
+        let auth_mode = auth.map(str::to_string).or_else(|| env("UAI_AUTH")).or_else(|| data.auth.clone());
+        let token = token.map(str::to_string).or_else(|| env("UAI_TOKEN")).or_else(|| data.token.clone());
+        let auth = ClientAuth::resolve(auth_mode.as_deref(), token.as_deref())?;
         if !cfg_file.exists() {
-            let _ = Self::write_file(
-                &cfg_file,
-                &ConfigFile { library: None, libraries: Some(roots.clone()), server: None, cache_dir: None },
-            );
+            let _ = Self::write_file(&cfg_file, &ConfigFile { libraries: Some(roots.clone()), ..Default::default() });
         }
-        Ok(Config { libraries: roots.iter().map(|s| expand_tilde(s)).collect(), home: home_dir, server, cache_dir })
+        Ok(Config {
+            libraries: roots.iter().map(|s| expand_tilde(s)).collect(),
+            home: home_dir,
+            server,
+            cache_dir,
+            auth,
+        })
     }
 
     fn save_roots(&mut self, roots: Vec<String>) -> Result<()> {
@@ -178,6 +240,25 @@ impl Config {
         data.cache_dir = dir.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
         Self::write_file(&self.config_file(), &data)?;
         self.cache_dir = data.cache_dir.as_deref().map(expand_tilde);
+        Ok(())
+    }
+
+    /// Persist the remote-mode auth. `token` replaces the stored token when given; `clear` drops both.
+    pub fn save_auth(&mut self, mode: Option<&str>, token: Option<&str>, clear: bool) -> Result<()> {
+        let mut data = Self::read_file(&self.config_file());
+        if clear {
+            data.auth = None;
+            data.token = None;
+        }
+        if let Some(t) = token.map(str::trim).filter(|t| !t.is_empty()) {
+            data.token = Some(t.to_string());
+        }
+        if let Some(m) = mode {
+            data.auth = Some(m.trim().to_ascii_lowercase());
+        }
+        let resolved = ClientAuth::resolve(data.auth.as_deref(), data.token.as_deref())?;
+        Self::write_file(&self.config_file(), &data)?;
+        self.auth = resolved;
         Ok(())
     }
 

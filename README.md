@@ -12,7 +12,8 @@ dependencies to install. It ships as:
 * an **index server with a web UI** (`uai serve`): search, filter, thumbnails, dependency trees,
   text/image/audio preview, and "download as slim `.unitypackage`";
 * a **remote mode** (`uai --server http://host:7878 ...`): client machines use the server's index and
-  get exports streamed to them, without mounting the file share or building an index;
+  get exports streamed to them, without mounting the file share or building an index; the server
+  can require a shared token or a Google sign-in (`--auth-token`, `--google-domain`);
 * an **MCP server** (`uai mcp`) and a Claude Code / Codex **skill** for agents.
 
 ## Install
@@ -59,7 +60,7 @@ uai --library /mnt/a --library /mnt/b index      # or per call; UAI_LIBRARY take
 uai packages                                     # shows @root when more than one root is indexed
 ```
 
-Settings live in `~/.unity-asset-index/config.json` (`libraries`, `server`); the index in
+Settings live in `~/.unity-asset-index/config.json` (`libraries`, `server`, `auth`, `token`); the index in
 `~/.unity-asset-index/index.db`, thumbnails in `previews.db`. Override the directory with
 `--home` / `UAI_HOME`.
 
@@ -107,7 +108,7 @@ file name, or `#<id>`. Ambiguous names return the candidates. Every command has 
 
 ```bash
 uai serve                       # 127.0.0.1:7878
-uai serve --bind 0.0.0.0:7878   # reachable by the team (there is no auth; keep it on the LAN)
+uai serve --bind 0.0.0.0:7878   # reachable by the team (open: keep it on the LAN, or see Authentication)
 ```
 
 The UI offers full-text search with kind / package / publisher / extension filters, a thumbnail
@@ -131,6 +132,43 @@ The JSON API behind it (`/api/search`, `/api/assets/{id}`, `/api/deps`, `/api/ex
 `/api/export/unitypackage`, ...) is what remote mode and the UI use; responses have the same shape
 as the CLI's `--json` output.
 
+### Authentication
+
+By default the server is open: anyone who can reach it can search and download. To run it beyond a
+trusted LAN, require credentials:
+
+```bash
+uai serve --bind 0.0.0.0:7878 --auth-token "$TEAM_TOKEN"       # shared token(s); or $UAI_AUTH_TOKENS, --auth-token-file
+uai serve --bind 0.0.0.0:7878 --google-domain example.com      # anyone in the Google Workspace domain example.com
+uai serve --bind 0.0.0.0:7878 --google-email alice@gmail.com --google-email ci@proj.iam.gserviceaccount.com
+```
+
+The options combine: a request gets through with any configured token or with a Google ID token of an
+allowed account. Google ID tokens are verified by the server itself (RS256 signature against Google's
+published keys, issuer, audience, expiry, verified email), then the account must match
+`--google-domain` (the token's `hd` claim) or `--google-email`. The accepted audience defaults to the
+gcloud CLI's client id, which is what `gcloud auth print-identity-token` puts in tokens for user
+accounts; tokens minted for another audience need `--google-audience` (service accounts:
+`gcloud auth print-identity-token --audiences=AUD --include-email`). The server fetches Google's keys
+from www.googleapis.com, so it needs outbound HTTPS.
+
+Clients send the credential as `Authorization: Bearer`:
+
+```bash
+uai --server https://uai.example.com --token "$TEAM_TOKEN" search chest   # or UAI_TOKEN / config --set-token
+uai --server https://uai.example.com --auth google search chest         # your gcloud identity, renewed automatically
+uai config --set-server https://uai.example.com --set-auth google       # remember both
+claude mcp add unity-assets -- uai --server https://uai.example.com --auth google mcp
+```
+
+In a browser the UI asks for a token; `uai web` opens it already signed in (a one-time code in the
+URL is exchanged for a session cookie that lasts `--session-hours`, 12 by default). Session cookies
+are signed with a key kept in `<home>/session.key`; delete it to sign everyone out.
+
+`uai serve` speaks plain HTTP, so put TLS in front of it (a reverse proxy, a load balancer, Cloud
+Run) before tokens cross a network you do not trust. The session cookie is marked `Secure` when the
+proxy sends `X-Forwarded-Proto: https`. `/healthz` stays open for health checks.
+
 Thumbnails come from the `preview.png` files inside the packages and are stored during
 `uai index`. An index built by an older version has none yet: run `uai index` again (it re-scans
 packages that lack thumbnails) or leave it, the asset panel can pull a thumbnail on demand. Indexes
@@ -145,7 +183,8 @@ written by the Python prototype (schema v1) are migrated in place on first open.
   (Codex: `~/.codex/skills/`).
 * **MCP server**: `uai mcp` serves `list_packages`, `search_assets`, `list_package_assets`,
   `asset_info`, `dependencies`, `export_assets`, `read_text_asset` over stdio. Register it with
-  `claude mcp add unity-assets -- uai mcp` (add `--server URL` for remote mode).
+  `claude mcp add unity-assets -- uai mcp` (add `--server URL` for remote mode, and `--auth google`
+  or `--token` when the server requires it).
 
 ## How it works
 
@@ -202,4 +241,5 @@ tests/e2e.rs          end-to-end tests on synthetic packages, including server +
 * Some packages ship nested `.unitypackage` files (Synty's URP/HDRP variants, for example). Their
   contents are not indexed; `uai search -e unitypackage` lists them and `uai export --out` extracts
   one so it can be imported by hand or added to the library folder.
-* The server has no authentication. Bind it to localhost or a trusted LAN.
+* Without `--auth-token` / `--google-domain` / `--google-email` the server is open. Bind it to
+  localhost or a trusted LAN, or turn auth on and put TLS in front.

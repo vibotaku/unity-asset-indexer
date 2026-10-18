@@ -13,6 +13,12 @@ pub enum UaiError {
     Invalid(String),
     #[error("{0}")]
     Remote(String),
+    /// The server wants credentials, or rejected the ones sent.
+    #[error("{0}")]
+    Unauthorized(String),
+    /// Valid identity, but not on the server's list.
+    #[error("{0}")]
+    Forbidden(String),
 }
 
 impl UaiError {
@@ -30,6 +36,8 @@ impl UaiError {
             UaiError::Ambiguous { .. } => 409,
             UaiError::Invalid(_) => 400,
             UaiError::Remote(_) => 502,
+            UaiError::Unauthorized(_) => 401,
+            UaiError::Forbidden(_) => 403,
         }
     }
 
@@ -53,6 +61,8 @@ impl UaiError {
                 package_candidates: api.package_candidates,
             },
             400 => UaiError::Invalid(api.error),
+            401 => UaiError::Unauthorized(api.error),
+            403 => UaiError::Forbidden(api.error),
             _ => UaiError::Remote(api.error),
         }
     }

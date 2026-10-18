@@ -180,7 +180,7 @@ fn fixture() -> Fixture {
     );
     let home = root.join("home");
     fs::create_dir_all(&home).unwrap();
-    let cfg = Config { libraries: vec![lib.clone()], home, server: None, cache_dir: None };
+    let cfg = Config { libraries: vec![lib.clone()], home, server: None, cache_dir: None, auth: Default::default() };
     let mut db = Database::open_with_previews(&cfg.db_path(), &cfg.previews_path()).unwrap();
     let opts = IndexOptions { workers: 1, ..Default::default() };
     let mut log = |_: &str| {};
@@ -422,7 +422,7 @@ fn server_and_remote_client() {
     let handle = rt.spawn(async move { axum::serve(listener, app).await.unwrap() });
     let base = format!("http://{addr}");
 
-    let remote = uai::client::RemoteService::new(&base).unwrap();
+    let remote = uai::client::RemoteService::new(&base, Default::default()).unwrap();
     assert_eq!(remote.stats().unwrap().packages, 2);
     assert_eq!(remote.packages().unwrap().len(), 2);
     let hits = remote
@@ -474,6 +474,87 @@ fn server_and_remote_client() {
 }
 
 #[test]
+fn protected_server_tokens_sessions_and_tickets() {
+    use uai::config::ClientAuth;
+    use uai::error::UaiError;
+    use uai::server::auth::{Auth, AuthConfig};
+
+    let f = fixture();
+    let auth = Auth::new(AuthConfig { tokens: vec!["team-secret".into()], ..Default::default() }, &f.cfg.home).unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+    let listener = rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = uai::server::router_with_auth(f.cfg.clone(), Some(std::sync::Arc::new(auth)));
+    let handle = rt.spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    // The CLI client: no token, a wrong one, the right one.
+    let err = uai::client::RemoteService::new(&base, ClientAuth::None).unwrap().stats().unwrap_err();
+    assert!(
+        matches!(err.downcast_ref::<UaiError>(), Some(UaiError::Unauthorized(m)) if m.contains("--token")),
+        "{err:#}"
+    );
+    let wrong = uai::client::RemoteService::new(&base, ClientAuth::Token("nope".into())).unwrap();
+    assert!(matches!(wrong.stats().unwrap_err().downcast_ref::<UaiError>(), Some(UaiError::Unauthorized(_))));
+    let remote = uai::client::RemoteService::new(&base, ClientAuth::Token("team-secret".into())).unwrap();
+    assert_eq!(remote.stats().unwrap().packages, 2);
+    let pkg_out = f.root.join("authed.unitypackage");
+    let req = ExportRequest { identifiers: vec!["Chest.prefab".into()], include_deps: true, ..Default::default() };
+    let mut log = |_: &str| {};
+    remote
+        .export(&req, &uai::service::ExportDest::UnityPackage(pkg_out.clone()), &Default::default(), &mut log)
+        .unwrap();
+    assert!(pkg_out.is_file());
+
+    // Plain HTTP: what a browser sees.
+    let http: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+    let get = |path: &str, cookie: Option<&str>| {
+        let mut r = http.get(format!("{base}{path}"));
+        if let Some(c) = cookie {
+            r = r.header("Cookie", c);
+        }
+        r.call().unwrap()
+    };
+    assert_eq!(get("/healthz", None).status(), 200);
+    assert_eq!(get("/", None).status(), 200, "the UI shell loads so it can show the sign-in form");
+    assert_eq!(get("/api/stats", None).status(), 401);
+    assert_eq!(get("/api/assets/1/preview.png", None).status(), 401);
+    let status: serde_json::Value = get("/api/auth", None).body_mut().read_json().unwrap();
+    assert_eq!(status["required"], true);
+    assert_eq!(status["user"], serde_json::Value::Null);
+
+    // `uai web`: a one-time code in the URL fragment, exchanged for a session cookie.
+    let url = remote.web_url().unwrap();
+    let ticket = url.split_once("#ticket=").unwrap().1.to_string();
+    let login = |body: serde_json::Value| http.post(format!("{base}/api/login")).send_json(body).unwrap();
+    let resp = login(serde_json::json!({ "ticket": ticket }));
+    assert_eq!(resp.status(), 200);
+    let set_cookie = resp.headers().get("set-cookie").unwrap().to_str().unwrap().to_string();
+    assert!(set_cookie.contains("HttpOnly") && set_cookie.contains("SameSite=Strict"), "{set_cookie}");
+    let cookie = set_cookie.split(';').next().unwrap().to_string();
+    assert_eq!(get("/api/stats", Some(&cookie)).status(), 200);
+    let me: serde_json::Value = get("/api/auth", Some(&cookie)).body_mut().read_json().unwrap();
+    assert_eq!(me["user"], "token #1");
+    assert_eq!(login(serde_json::json!({ "ticket": ticket })).status(), 401, "tickets are single-use");
+    // Pasting the token into the sign-in form works too; a bad one does not.
+    assert_eq!(login(serde_json::json!({ "token": "team-secret" })).status(), 200);
+    assert_eq!(login(serde_json::json!({ "token": "nope" })).status(), 401);
+    let out = http.post(format!("{base}/api/logout")).send_empty().unwrap();
+    assert!(out.headers().get("set-cookie").unwrap().to_str().unwrap().contains("Max-Age=0"));
+    handle.abort();
+}
+
+#[test]
+fn client_auth_resolution() {
+    use uai::config::ClientAuth;
+    assert_eq!(ClientAuth::resolve(None, None).unwrap(), ClientAuth::None);
+    assert_eq!(ClientAuth::resolve(None, Some("t")).unwrap(), ClientAuth::Token("t".into()));
+    assert_eq!(ClientAuth::resolve(Some("google"), Some("t")).unwrap(), ClientAuth::Google);
+    assert_eq!(ClientAuth::resolve(Some("none"), Some("t")).unwrap(), ClientAuth::None);
+    assert!(ClientAuth::resolve(Some("token"), None).is_err());
+    assert!(ClientAuth::resolve(Some("kerberos"), None).is_err());
+}
+
+#[test]
 fn multiple_library_roots() {
     let f = fixture();
     // A second root with its own package; an unreachable third root must not break indexing.
@@ -495,6 +576,7 @@ fn multiple_library_roots() {
         home: f.cfg.home.clone(),
         server: None,
         cache_dir: None,
+        auth: Default::default(),
     };
     let mut db = Database::open_with_previews(&cfg.db_path(), &cfg.previews_path()).unwrap();
     let mut log = |_: &str| {};
@@ -518,6 +600,7 @@ fn multiple_library_roots() {
         home: f.cfg.home.clone(),
         server: None,
         cache_dir: None,
+        auth: Default::default(),
     };
     let rep =
         index_library(&cfg1, &mut db, &IndexOptions { workers: 1, ..Default::default() }, &mut log, None).unwrap();
