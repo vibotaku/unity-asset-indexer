@@ -19,6 +19,9 @@ Two ways to run it:
 * **Remote**: a teammate runs `uai serve`; use `uai --server http://host:7878 ...` (or
   `uai config --set-server URL` once, or `UAI_SERVER`). Everything below works the same, exports are
   streamed from the server. No share, no index needed on this machine.
+  A protected server answers "requires authentication": add `--auth google` (sends the gcloud
+  identity; needs `gcloud auth login`) or `--token <team token>`, or persist it once with
+  `uai config --set-auth google`. Never print or commit a token; ask the user for it.
 
 ## Important consideration
 
@@ -88,5 +91,5 @@ candidate list; pick the guid.
   package's `unity_version`/description in `uai packages` and the shader guid in `uai deps`.
 * The index tracks guid references only. `Resources.Load`, Addressables and `Shader.Find` by name are
   invisible; check scripts with `uai cat` if a prefab looks incomplete.
-* The user can browse the same index visually with `uai serve --open`; point them there when they
-  want to pick assets by eye.
+* The user can browse the same index visually with `uai serve --open` (local) or `uai web` (remote,
+  opens the server's UI signed in); point them there when they want to pick assets by eye.

@@ -1,15 +1,22 @@
 //! Remote mode: run the read-only commands (and exports) against a `uai serve` instance over HTTP,
 //! so client machines do not need the SMB share mounted or an index of their own.
+//!
+//! A protected server gets `Authorization: Bearer` on every request: the configured token, or a
+//! Google ID token from `gcloud`, cached until shortly before it expires.
 
 use std::collections::HashMap;
 use std::io::{BufWriter, Read, Write};
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use serde::de::DeserializeOwned;
-use ureq::Agent;
+use ureq::{Agent, RequestBuilder};
 
+use crate::config::ClientAuth;
 use crate::error::UaiError;
 use crate::exporter;
 use crate::model::*;
@@ -18,7 +25,13 @@ use crate::service::{validate_project, ExportDest, ExportOptions, Service};
 pub struct RemoteService {
     pub base: String,
     agent: Agent,
+    auth: ClientAuth,
+    /// Google mode: the current ID token and its `exp`.
+    id_token: Mutex<Option<(String, u64)>>,
 }
+
+/// Renew a cached Google ID token when it has less than this left.
+const ID_TOKEN_MARGIN_SECS: u64 = 300;
 
 #[derive(serde::Serialize)]
 struct DepsBody<'a> {
@@ -29,7 +42,7 @@ struct DepsBody<'a> {
 }
 
 impl RemoteService {
-    pub fn new(base: &str) -> Result<RemoteService> {
+    pub fn new(base: &str, auth: ClientAuth) -> Result<RemoteService> {
         let base = base.trim().trim_end_matches('/').to_string();
         if !base.starts_with("http://") && !base.starts_with("https://") {
             return Err(
@@ -41,11 +54,39 @@ impl RemoteService {
             .timeout_global(Some(Duration::from_secs(3600)))
             .user_agent(format!("uai/{}", crate::VERSION))
             .build();
-        Ok(RemoteService { base, agent: config.into() })
+        Ok(RemoteService { base, agent: config.into(), auth, id_token: Mutex::new(None) })
     }
 
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.base, path)
+    }
+
+    /// The bearer credential to send, if any.
+    fn bearer(&self) -> Result<Option<String>> {
+        match &self.auth {
+            ClientAuth::None => Ok(None),
+            ClientAuth::Token(t) => Ok(Some(t.clone())),
+            ClientAuth::Google => {
+                let mut cached = self.id_token.lock().unwrap();
+                let now = crate::server::auth::now_secs();
+                if let Some((t, exp)) = cached.as_ref() {
+                    if *exp > now + ID_TOKEN_MARGIN_SECS {
+                        return Ok(Some(t.clone()));
+                    }
+                }
+                let token = gcloud_id_token()?;
+                let exp = jwt_exp(&token).unwrap_or(now + 3000);
+                *cached = Some((token.clone(), exp));
+                Ok(Some(token))
+            }
+        }
+    }
+
+    fn authed<B>(&self, req: RequestBuilder<B>) -> Result<RequestBuilder<B>> {
+        Ok(match self.bearer()? {
+            Some(t) => req.header("Authorization", format!("Bearer {t}")),
+            None => req,
+        })
     }
 
     fn check(&self, resp: &mut ureq::http::Response<ureq::Body>) -> Result<()> {
@@ -54,16 +95,25 @@ impl RemoteService {
             return Ok(());
         }
         let text = resp.body_mut().read_to_string().unwrap_or_default();
-        let api: ApiError = serde_json::from_str(&text).unwrap_or_else(|_| ApiError {
+        let mut api: ApiError = serde_json::from_str(&text).unwrap_or_else(|_| ApiError {
             error: format!("server returned HTTP {status}: {}", text.trim()),
             candidates: vec![],
             package_candidates: vec![],
         });
+        if status == 401 {
+            api.error = match self.auth {
+                ClientAuth::None => format!(
+                    "{}: {} needs a token; pass --token / set UAI_TOKEN, or --auth google to send your gcloud identity",
+                    api.error, self.base
+                ),
+                _ => format!("{} (sent {} auth to {})", api.error, self.auth.label(), self.base),
+            };
+        }
         Err(UaiError::from_api(status, api).into())
     }
 
     fn get_json<T: DeserializeOwned>(&self, path: &str, query: &[(&str, String)]) -> Result<T> {
-        let mut req = self.agent.get(self.url(path));
+        let mut req = self.authed(self.agent.get(self.url(path)))?;
         for (k, v) in query {
             if !v.is_empty() {
                 req = req.query(*k, v);
@@ -75,14 +125,16 @@ impl RemoteService {
     }
 
     fn post_json<B: serde::Serialize, T: DeserializeOwned>(&self, path: &str, body: &B) -> Result<T> {
-        let mut resp =
-            self.agent.post(self.url(path)).send_json(body).with_context(|| format!("POST {}{}", self.base, path))?;
+        let mut resp = self
+            .authed(self.agent.post(self.url(path)))?
+            .send_json(body)
+            .with_context(|| format!("POST {}{}", self.base, path))?;
         self.check(&mut resp)?;
         Ok(resp.body_mut().with_config().limit(1 << 30).read_json::<T>()?)
     }
 
     fn get_bytes(&self, path: &str, query: &[(&str, String)]) -> Result<Vec<u8>> {
-        let mut req = self.agent.get(self.url(path));
+        let mut req = self.authed(self.agent.get(self.url(path)))?;
         for (k, v) in query {
             if !v.is_empty() {
                 req = req.query(*k, v);
@@ -97,8 +149,7 @@ impl RemoteService {
     fn download_package(&self, req: &ExportRequest, out: &Path, log: &mut dyn FnMut(&str)) -> Result<u64> {
         log(&format!("downloading package from {}", self.base));
         let mut resp = self
-            .agent
-            .post(self.url("/api/export/unitypackage"))
+            .authed(self.agent.post(self.url("/api/export/unitypackage")))?
             .send_json(req)
             .with_context(|| format!("POST {}/api/export/unitypackage", self.base))?;
         self.check(&mut resp)?;
@@ -122,6 +173,50 @@ impl RemoteService {
     fn pkg_query(package: Option<&str>) -> Vec<(&'static str, String)> {
         vec![("package", package.unwrap_or("").to_string())]
     }
+
+    /// The web UI's address; for a protected server, with a one-time sign-in code (`uai web`).
+    pub fn web_url(&self) -> Result<String> {
+        let status: serde_json::Value = self.get_json("/api/auth", &[])?;
+        if !status["required"].as_bool().unwrap_or(false) {
+            return Ok(format!("{}/", self.base));
+        }
+        let t: serde_json::Value = self.post_json("/api/login/ticket", &serde_json::json!({}))?;
+        match t["ticket"].as_str() {
+            Some(ticket) => Ok(format!("{}/#ticket={ticket}", self.base)),
+            None => bail!("{} did not issue a sign-in code", self.base),
+        }
+    }
+}
+
+/// `gcloud auth print-identity-token` for the active gcloud account.
+fn gcloud_id_token() -> Result<String> {
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", "gcloud"]);
+        c
+    };
+    #[cfg(not(windows))]
+    let mut cmd = std::process::Command::new("gcloud");
+    let out = cmd
+        .args(["auth", "print-identity-token"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .context("running `gcloud auth print-identity-token` (auth google needs the Google Cloud CLI on PATH)")?;
+    let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !out.status.success() || token.is_empty() {
+        bail!(
+            "`gcloud auth print-identity-token` failed ({}); sign in with `gcloud auth login`",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(token)
+}
+
+/// `exp` of a JWT, read without verifying it (only to know when to renew our own token).
+fn jwt_exp(token: &str) -> Option<u64> {
+    let payload = URL_SAFE_NO_PAD.decode(token.split('.').nth(1)?).ok()?;
+    serde_json::from_slice::<serde_json::Value>(&payload).ok()?["exp"].as_u64()
 }
 
 impl Service for RemoteService {

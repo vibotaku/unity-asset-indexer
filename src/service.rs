@@ -282,7 +282,7 @@ impl Service for LocalService {
 /// Open the right service for the configuration: remote when a server is configured, else local.
 pub fn open_service(cfg: &Config) -> Result<Box<dyn Service>> {
     if let Some(url) = &cfg.server {
-        return Ok(Box::new(crate::client::RemoteService::new(url)?));
+        return Ok(Box::new(crate::client::RemoteService::new(url, cfg.auth.clone())?));
     }
     Ok(Box::new(LocalService::open(cfg).context("opening the index")?))
 }

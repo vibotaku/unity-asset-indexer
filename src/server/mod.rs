@@ -2,14 +2,20 @@
 //!
 //! Every request opens its own SQLite connection on a blocking thread (SQLite handles the
 //! concurrency; connections are cheap in WAL mode), so the async side never touches rusqlite.
+//!
+//! Optional auth (`--auth-token`, `--google-domain`, `--google-email`) lives in [`auth`]; the
+//! middleware here applies it to everything except the UI shell, `/healthz` and the sign-in calls.
+
+pub mod auth;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use axum::body::Body;
-use axum::extract::{Path, Query, State};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::body::{Body, Bytes};
+use axum::extract::{Path, Query, Request, State};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -21,6 +27,7 @@ use crate::error::UaiError;
 use crate::exporter;
 use crate::model::*;
 use crate::service::{LocalService, Service};
+use auth::{Auth, AuthConfig, Denied, Principal};
 
 const INDEX_HTML: &str = include_str!("../../web/index.html");
 const APP_JS: &str = include_str!("../../web/app.js");
@@ -46,6 +53,8 @@ const RAW_MAX_BYTES: usize = 256 * 1024 * 1024;
 
 struct AppState {
     cfg: Config,
+    /// `None` when the server runs open (no tokens or Google accounts configured).
+    auth: Option<Arc<Auth>>,
 }
 
 type Shared = Arc<AppState>;
@@ -476,8 +485,170 @@ async fn api_export_unitypackage(State(st): State<Shared>, Json(req): Json<Expor
     Ok(resp)
 }
 
+// ----- auth ---------------------------------------------------------------------------------------
+
+/// Reachable without credentials: the UI shell (so it can show the sign-in form), the health check
+/// and the sign-in calls themselves.
+fn is_public(path: &str) -> bool {
+    matches!(
+        path,
+        "/" | "/app.js" | "/style.css" | "/viewer.js" | "/healthz" | "/api/auth" | "/api/login" | "/api/logout"
+    ) || path.starts_with("/vendor/")
+}
+
+fn bearer(headers: &HeaderMap) -> Option<String> {
+    let v = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let (scheme, cred) = v.trim().split_once(' ')?;
+    scheme.eq_ignore_ascii_case("bearer").then(|| cred.trim().to_string())
+}
+
+fn session_cookie(headers: &HeaderMap) -> Option<String> {
+    let prefix = format!("{}=", auth::SESSION_COOKIE);
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(';'))
+        .find_map(|c| c.trim().strip_prefix(prefix.as_str()).map(str::to_string))
+}
+
+/// Who is calling. A bearer credential wins over the session cookie.
+async fn authenticate(auth: &Arc<Auth>, headers: &HeaderMap) -> std::result::Result<Principal, Denied> {
+    if let Some(cred) = bearer(headers) {
+        return check_bearer(auth, cred).await;
+    }
+    session_cookie(headers).and_then(|c| auth.check_session(&c)).ok_or(Denied::Missing)
+}
+
+/// Bearer checks can fetch Google's keys, so they run on a blocking thread.
+async fn check_bearer(auth: &Arc<Auth>, cred: String) -> std::result::Result<Principal, Denied> {
+    let auth = auth.clone();
+    tokio::task::spawn_blocking(move || auth.check_bearer(&cred))
+        .await
+        .unwrap_or_else(|e| Err(Denied::Unavailable(format!("auth worker panicked: {e}"))))
+}
+
+fn denied(d: Denied) -> Response {
+    let status = StatusCode::from_u16(d.status()).unwrap_or(StatusCode::UNAUTHORIZED);
+    let body = ApiError { error: d.message(), candidates: vec![], package_candidates: vec![] };
+    let mut resp = (status, Json(body)).into_response();
+    if status == StatusCode::UNAUTHORIZED {
+        resp.headers_mut().insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer realm=\"uai\""));
+    }
+    resp
+}
+
+async fn require_auth(State(state): State<Shared>, mut req: Request, next: Next) -> Response {
+    let Some(auth) = state.auth.clone() else { return next.run(req).await };
+    if is_public(req.uri().path()) {
+        return next.run(req).await;
+    }
+    match authenticate(&auth, req.headers()).await {
+        Ok(who) => {
+            req.extensions_mut().insert(who);
+            next.run(req).await
+        }
+        Err(d) => denied(d),
+    }
+}
+
+fn session_cookie_header(value: &str, max_age: u64, headers: &HeaderMap) -> HeaderValue {
+    let https =
+        headers.get("x-forwarded-proto").and_then(|v| v.to_str().ok()).is_some_and(|v| v.eq_ignore_ascii_case("https"));
+    let cookie = format!(
+        "{}={value}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}{}",
+        auth::SESSION_COOKIE,
+        if https { "; Secure" } else { "" }
+    );
+    HeaderValue::from_str(&cookie).unwrap_or(HeaderValue::from_static(""))
+}
+
+#[derive(serde::Serialize)]
+struct AuthStatus {
+    required: bool,
+    methods: Vec<&'static str>,
+    user: Option<String>,
+}
+
+async fn api_auth(State(state): State<Shared>, headers: HeaderMap) -> Json<AuthStatus> {
+    let Some(auth) = state.auth.clone() else {
+        return Json(AuthStatus { required: false, methods: vec![], user: None });
+    };
+    let mut methods = vec![];
+    if !auth.config().tokens.is_empty() {
+        methods.push("token");
+    }
+    if auth.config().google_enabled() {
+        methods.push("google");
+    }
+    let user = authenticate(&auth, &headers).await.ok().map(|p| p.0);
+    Json(AuthStatus { required: true, methods, user })
+}
+
+#[derive(Deserialize, Default)]
+struct LoginBody {
+    #[serde(default)]
+    token: Option<String>,
+    #[serde(default)]
+    ticket: Option<String>,
+}
+
+/// Exchange a credential for a session cookie: a one-time `ticket` (from `uai web`), a pasted
+/// `token`, or the request's bearer header.
+async fn api_login(State(state): State<Shared>, headers: HeaderMap, body: Bytes) -> Response {
+    let Some(auth) = state.auth.clone() else {
+        return Json(serde_json::json!({"user": null, "required": false})).into_response();
+    };
+    let body: LoginBody = serde_json::from_slice(&body).unwrap_or_default();
+    let who = if let Some(t) = body.ticket.filter(|t| !t.is_empty()) {
+        auth.redeem_ticket(&t)
+            .ok_or_else(|| Denied::Invalid("sign-in link expired or already used (run `uai web` again)".into()))
+    } else if let Some(token) = body.token.filter(|t| !t.trim().is_empty()) {
+        check_bearer(&auth, token).await
+    } else {
+        authenticate(&auth, &headers).await
+    };
+    match who {
+        Ok(who) => {
+            let (value, ttl) = auth.issue_session(&who);
+            let mut resp = Json(serde_json::json!({"user": who.0})).into_response();
+            resp.headers_mut().insert(header::SET_COOKIE, session_cookie_header(&value, ttl, &headers));
+            resp
+        }
+        Err(d) => denied(d),
+    }
+}
+
+/// A single-use sign-in code for the browser (`uai web`); the caller has already authenticated.
+async fn api_login_ticket(State(state): State<Shared>, req: Request) -> Response {
+    let Some(auth) = state.auth.clone() else { return Json(serde_json::json!({"ticket": null})).into_response() };
+    match req.extensions().get::<Principal>() {
+        Some(who) => Json(serde_json::json!({
+            "ticket": auth.issue_ticket(who),
+            "expires_in": auth::TICKET_TTL.as_secs(),
+        }))
+        .into_response(),
+        None => denied(Denied::Missing),
+    }
+}
+
+async fn api_logout(headers: HeaderMap) -> Response {
+    let mut resp = Json(serde_json::json!({"user": null})).into_response();
+    resp.headers_mut().insert(header::SET_COOKIE, session_cookie_header("", 0, &headers));
+    resp
+}
+
+async fn healthz() -> &'static str {
+    "ok"
+}
+
+/// The API and UI without auth (LAN use, tests).
 pub fn router(cfg: Config) -> Router {
-    let state: Shared = Arc::new(AppState { cfg });
+    router_with_auth(cfg, None)
+}
+
+pub fn router_with_auth(cfg: Config, auth: Option<Arc<Auth>>) -> Router {
+    let state: Shared = Arc::new(AppState { cfg, auth: auth.filter(|a| a.enabled()) });
     Router::new()
         .route("/", get(index_html))
         .route("/app.js", get(app_js))
@@ -504,17 +675,24 @@ pub fn router(cfg: Config) -> Router {
         .route("/api/assets/{id}/meta", get(api_meta))
         .route("/api/export/plan", post(api_export_plan))
         .route("/api/export/unitypackage", post(api_export_unitypackage))
+        .route("/healthz", get(healthz))
+        .route("/api/auth", get(api_auth))
+        .route("/api/login", post(api_login))
+        .route("/api/login/ticket", post(api_login_ticket))
+        .route("/api/logout", post(api_logout))
+        .layer(middleware::from_fn_with_state(state.clone(), require_auth))
         .layer(tower_http::cors::CorsLayer::permissive())
         .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024))
         .with_state(state)
 }
 
-pub fn serve(cfg: Config, bind: &str, open: bool) -> Result<()> {
+pub fn serve(cfg: Config, bind: &str, open: bool, auth_cfg: AuthConfig) -> Result<()> {
     if cfg.server.is_some() {
         anyhow::bail!("`uai serve` needs the local index; drop --server (or use --local)");
     }
     // Fail early with a clear message if the index cannot be opened.
     let stats = LocalService::open(&cfg)?.stats()?;
+    let auth = if auth_cfg.enabled() { Some(Arc::new(Auth::new(auth_cfg, &cfg.home)?)) } else { None };
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     rt.block_on(async move {
         let addr: SocketAddr = bind.parse().with_context(|| format!("invalid bind address {bind:?}"))?;
@@ -537,10 +715,18 @@ pub fn serve(cfg: Config, bind: &str, open: bool) -> Result<()> {
                 "NOT mounted, exports/previews of unindexed thumbnails will fail"
             }
         );
-        if open {
-            let _ = open_browser(&url);
+        match &auth {
+            Some(a) => eprintln!("auth: {}", a.config().describe()),
+            None if !local.ip().is_loopback() => eprintln!(
+                "warning: no authentication; anyone who can reach {url} can read and download the library \
+                 (see --auth-token, --google-domain)"
+            ),
+            None => {}
         }
-        axum::serve(listener, router(cfg))
+        if open {
+            let _ = crate::open_browser(&url);
+        }
+        axum::serve(listener, router_with_auth(cfg, auth))
             .with_graceful_shutdown(async {
                 let _ = tokio::signal::ctrl_c().await;
                 eprintln!("shutting down");
@@ -548,14 +734,4 @@ pub fn serve(cfg: Config, bind: &str, open: bool) -> Result<()> {
             .await?;
         Ok(())
     })
-}
-
-fn open_browser(url: &str) -> std::io::Result<()> {
-    #[cfg(target_os = "macos")]
-    let cmd = std::process::Command::new("open").arg(url).spawn();
-    #[cfg(target_os = "windows")]
-    let cmd = std::process::Command::new("cmd").args(["/C", "start", "", url]).spawn();
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let cmd = std::process::Command::new("xdg-open").arg(url).spawn();
-    cmd.map(|_| ())
 }

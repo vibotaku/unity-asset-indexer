@@ -24,6 +24,7 @@
   </form>
   <div class="top-right">
     <span id="stats" class="stats" aria-live="polite"></span>
+    <button id="signOut" class="ghost hidden" type="button">Sign out</button>
     <button id="basketBtn" class="ghost" type="button" title="Export basket">Basket <span id="basketCount" class="pill">0</span></button>
   </div>
 </header>
@@ -78,6 +79,17 @@
     <button id="basketClear" class="ghost" type="button">Clear</button>
   </div>
   <div id="planOut" class="plan-out"></div>
+</div>
+
+<div id="signin" class="signin hidden" role="dialog" aria-modal="true" aria-labelledby="signinTitle">
+  <form id="signinForm" class="signin-card" autocomplete="off">
+    <h2 id="signinTitle">Sign in to the asset library</h2>
+    <p class="muted">This server needs a sign-in. Quickest: run <code>uai web</code> on a machine where <code>uai</code> is set up for this server; it opens this page signed in.</p>
+    <p class="muted" id="signinMethods">Or paste a token:</p>
+    <input id="signinToken" type="password" placeholder="Token" aria-label="Token" required>
+    <div id="signinErr" class="signin-err" role="alert"></div>
+    <button type="submit" class="primary">Sign in</button>
+  </form>
 </div>
 
 <div id="toast" class="toast hidden" role="status"></div>

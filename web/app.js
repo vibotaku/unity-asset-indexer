@@ -101,11 +101,54 @@
     if (!r.ok) {
       let msg = `HTTP ${r.status}`;
       try { const j = await r.json(); msg = j.error || msg; } catch (_) {}
+      if (r.status === 401) showSignIn(msg);
       throw new Error(msg);
     }
     return r.json();
   }
   const postJson = (path, body) => api(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+
+  // ----- sign-in (servers started with --auth-token / --google-domain) ------------------------------
+  // The server answers with a session cookie, which also covers <img>/<audio> requests.
+  async function login(body) {
+    const r = await fetch('/api/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    let j = {};
+    try { j = await r.json(); } catch (_) {}
+    if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+    return j;
+  }
+  // `uai web` opens the page with #ticket=<one-time code>: trade it for a session and drop it from the URL.
+  async function redeemTicket() {
+    const p = new URLSearchParams(location.hash.replace(/^#/, ''));
+    const ticket = p.get('ticket');
+    if (!ticket) return;
+    p.delete('ticket');
+    const h = p.toString();
+    history.replaceState(null, '', h ? '#' + h : location.pathname);
+    try { await login({ ticket }); } catch (e) { toast(e.message, true); }
+  }
+  let signInShown = false;
+  function showSignIn(msg) {
+    if (signInShown) return;
+    signInShown = true;
+    const methods = (state.auth && state.auth.methods) || [];
+    const ways = [];
+    if (methods.includes('token')) ways.push('the team token');
+    if (methods.includes('google')) ways.push('a Google ID token from <code>gcloud auth print-identity-token</code>');
+    $('signinMethods').innerHTML = 'Or paste ' + (ways.length ? ways.join(', or ') : 'a token') + ':';
+    $('signinErr').textContent = msg || '';
+    $('signin').classList.remove('hidden');
+    const overlay = $('loadingOverlay');
+    if (overlay) overlay.classList.add('hidden');
+    $('signinToken').focus();
+  }
+  $('signinForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    $('signinErr').textContent = '';
+    try { await login({ token: $('signinToken').value.trim() }); location.reload(); }
+    catch (err) { $('signinErr').textContent = err.message; }
+  });
+  $('signOut').addEventListener('click', async () => { try { await fetch('/api/logout', { method: 'POST' }); } catch (_) {} location.reload(); });
 
   // ----- URL state --------------------------------------------------------------------------------
   function writeHash() {
@@ -673,7 +716,7 @@
     btn.innerHTML = '<span class="spinner"></span> building…';
     try {
       const r = await tracked(fetch('/api/export/unitypackage', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(exportRequest()) }));
-      if (!r.ok) { let m = `HTTP ${r.status}`; try { m = (await r.json()).error || m; } catch (_) {} throw new Error(m); }
+      if (!r.ok) { let m = `HTTP ${r.status}`; try { m = (await r.json()).error || m; } catch (_) {} if (r.status === 401) showSignIn(m); throw new Error(m); }
       const cd = r.headers.get('content-disposition') || '';
       const m = /filename="([^"]+)"/.exec(cd);
       const name = m ? m[1] : 'export.unitypackage';
@@ -707,10 +750,21 @@
     if (e.key === 'Escape') { if (!$('basket').classList.contains('hidden')) $('basket').classList.add('hidden'); else closeDetail(); }
     if (e.key === '/' && document.activeElement !== $('q') && !/INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName)) { e.preventDefault(); $('q').focus(); }
   });
-  window.addEventListener('hashchange', () => { readHash(); search(); if (state.detailId) openDetail(state.detailId); });
+  window.addEventListener('hashchange', async () => {
+    if (/(^#|&)ticket=/.test(location.hash)) { await redeemTicket(); location.reload(); return; }
+    readHash(); search(); if (state.detailId) openDetail(state.detailId);
+  });
   function setView(v) { state.view = v; try { localStorage.setItem('uai.view', v); } catch (_) {} $('viewGrid').classList.toggle('active', v === 'grid'); $('viewList').classList.toggle('active', v === 'list'); renderResults(); }
 
   (async () => {
+    await redeemTicket();
+    try { state.auth = await (await fetch('/api/auth')).json(); } catch (_) { state.auth = { required: false }; }
+    if (state.auth.required) {
+      if (!state.auth.user) { showSignIn(); return; }
+      const so = $('signOut');
+      so.classList.remove('hidden');
+      so.title = 'Signed in as ' + state.auth.user;
+    }
     readHash();
     setView(state.view);
     renderBasket();

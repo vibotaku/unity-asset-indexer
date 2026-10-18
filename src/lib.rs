@@ -17,6 +17,17 @@ pub mod unitypackage;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Open `url` in the default browser.
+pub fn open_browser(url: &str) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    let cmd = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(target_os = "windows")]
+    let cmd = std::process::Command::new("cmd").args(["/C", "start", "", url]).spawn();
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let cmd = std::process::Command::new("xdg-open").arg(url).spawn();
+    cmd.map(|_| ())
+}
+
 /// Human-readable byte count (`1.5MB`).
 pub fn human_bytes(n: i64) -> String {
     let mut v = n.max(0) as f64;

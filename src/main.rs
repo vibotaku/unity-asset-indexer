@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 
@@ -39,6 +39,12 @@ struct Cli {
     /// Extracted-package cache dir (default: config / $UAI_CACHE_DIR / <home>/cache)
     #[arg(long, global = true)]
     cache_dir: Option<String>,
+    /// Bearer token for a server that requires one (or $UAI_TOKEN / config --set-token)
+    #[arg(long, global = true, value_name = "TOKEN")]
+    token: Option<String>,
+    /// How to authenticate to the server: token, google (your gcloud identity) or none (or $UAI_AUTH / config)
+    #[arg(long, global = true, value_name = "MODE")]
+    auth: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -75,6 +81,15 @@ enum Cmd {
         /// Go back to the default cache dir (<home>/cache)
         #[arg(long)]
         clear_cache_dir: bool,
+        /// Persist how remote mode authenticates: token, google or none
+        #[arg(long = "set-auth", value_name = "MODE")]
+        set_auth: Option<String>,
+        /// Persist a bearer token for the server (config.json becomes private, mode 0600)
+        #[arg(long = "set-token", value_name = "TOKEN")]
+        set_token: Option<String>,
+        /// Forget the stored auth mode and token
+        #[arg(long, conflicts_with_all = ["set_auth", "set_token"])]
+        clear_auth: bool,
         #[command(flatten)]
         json: JsonFlag,
     },
@@ -261,6 +276,37 @@ enum Cmd {
         /// Open the UI in a browser once the server is up
         #[arg(long)]
         open: bool,
+        /// Require this bearer token (repeat; comma-separated in the env var)
+        #[arg(
+            long = "auth-token",
+            value_name = "TOKEN",
+            env = "UAI_AUTH_TOKENS",
+            value_delimiter = ',',
+            hide_env_values = true
+        )]
+        auth_tokens: Vec<String>,
+        /// Read accepted tokens from a file, one per line (# comments allowed)
+        #[arg(long = "auth-token-file", value_name = "FILE")]
+        auth_token_file: Option<PathBuf>,
+        /// Accept Google ID tokens of accounts in this Google Workspace domain (repeat)
+        #[arg(long = "google-domain", value_name = "DOMAIN", env = "UAI_GOOGLE_DOMAINS", value_delimiter = ',')]
+        google_domains: Vec<String>,
+        /// Accept Google ID tokens of this account, user or service account (repeat)
+        #[arg(long = "google-email", value_name = "EMAIL", env = "UAI_GOOGLE_EMAILS", value_delimiter = ',')]
+        google_emails: Vec<String>,
+        /// Accepted `aud` of Google ID tokens (repeat; default: the gcloud CLI's client id, which
+        /// `gcloud auth print-identity-token` uses for user accounts)
+        #[arg(long = "google-audience", value_name = "AUD", env = "UAI_GOOGLE_AUDIENCES", value_delimiter = ',')]
+        google_audiences: Vec<String>,
+        /// How long a web UI sign-in lasts
+        #[arg(long, value_name = "HOURS", default_value_t = 12)]
+        session_hours: u64,
+    },
+    /// Open the server's web UI in a browser, signed in when the server requires it
+    Web {
+        /// Only print the URL (it holds a one-time sign-in code valid for 60 s)
+        #[arg(long)]
+        print: bool,
     },
     /// Run the MCP server (stdio) for agents
     Mcp,
@@ -291,7 +337,14 @@ fn main() {
 }
 
 fn run(cli: Cli) -> Result<()> {
-    let mut cfg = Config::load(&cli.library, cli.home.as_deref(), cli.server.as_deref(), cli.cache_dir.as_deref())?;
+    let mut cfg = Config::load(
+        &cli.library,
+        cli.home.as_deref(),
+        cli.server.as_deref(),
+        cli.cache_dir.as_deref(),
+        cli.auth.as_deref(),
+        cli.token.as_deref(),
+    )?;
     if cli.local {
         cfg.server = None;
     }
@@ -304,6 +357,9 @@ fn run(cli: Cli) -> Result<()> {
             clear_server,
             set_cache_dir,
             clear_cache_dir,
+            set_auth,
+            set_token,
+            clear_auth,
             json,
         } => {
             if let Some(d) = set_cache_dir {
@@ -311,6 +367,9 @@ fn run(cli: Cli) -> Result<()> {
             }
             if clear_cache_dir {
                 cfg.save_cache_dir(None)?;
+            }
+            if set_auth.is_some() || set_token.is_some() || clear_auth {
+                cfg.save_auth(set_auth.as_deref(), set_token.as_deref(), clear_auth)?;
             }
             cmd_config(cfg, set_library, add_library, remove_library, set_server, clear_server, json.json)
         }
@@ -396,12 +455,49 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Cache { action, package, all, min_mb, workers, json } => {
             cmd_cache(&cfg, &action, package.as_deref(), all, min_mb, workers, json.json)
         }
-        Cmd::Serve { bind, open } => uai::server::serve(cfg, &bind, open),
+        Cmd::Serve {
+            bind,
+            open,
+            mut auth_tokens,
+            auth_token_file,
+            google_domains,
+            google_emails,
+            google_audiences,
+            session_hours,
+        } => {
+            if let Some(f) = auth_token_file {
+                let text = std::fs::read_to_string(&f).with_context(|| format!("reading {}", f.display()))?;
+                auth_tokens.extend(
+                    text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).map(str::to_string),
+                );
+            }
+            let auth = uai::server::auth::AuthConfig {
+                tokens: auth_tokens,
+                google_domains,
+                google_emails,
+                google_audiences,
+                session_hours,
+            };
+            uai::server::serve(cfg, &bind, open, auth)
+        }
+        Cmd::Web { print } => cmd_web(&cfg, print),
         Cmd::Mcp => uai::mcp::run(cfg),
     }
 }
 
 // ----- commands -------------------------------------------------------------------------------------
+
+fn cmd_web(cfg: &Config, print_only: bool) -> Result<()> {
+    let Some(server) = &cfg.server else {
+        bail!("no server configured (--server / UAI_SERVER / config --set-server); for the local index run `uai serve --open`");
+    };
+    let url = uai::client::RemoteService::new(server, cfg.auth.clone())?.web_url()?;
+    println!("{url}");
+    if !print_only {
+        uai::open_browser(&url).with_context(|| format!("opening {url}"))?;
+    }
+    Ok(())
+}
 
 fn cmd_config(
     mut cfg: Config,
@@ -454,6 +550,7 @@ fn cmd_config(
     info.insert("previews_db", cfg.previews_path().to_string_lossy().to_string().into());
     info.insert("cache_dir", cfg.cache_dir().to_string_lossy().to_string().into());
     info.insert("server", cfg.server.clone().map(Into::into).unwrap_or(serde_json::Value::Null));
+    info.insert("auth", cfg.auth.label().into());
     info.insert("version", uai::VERSION.into());
     let stats: Result<Stats> = (|| {
         let svc = open_service(&cfg)?;
