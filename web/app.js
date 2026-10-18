@@ -138,9 +138,38 @@
     $('signinMethods').innerHTML = 'Or paste ' + (ways.length ? ways.join(', or ') : 'a token') + ':';
     $('signinErr').textContent = msg || '';
     $('signin').classList.remove('hidden');
+    if (state.auth && state.auth.google_client_id) showGoogleButton(state.auth.google_client_id, state.auth.google_hd);
     const overlay = $('loadingOverlay');
     if (overlay) overlay.classList.add('hidden');
     $('signinToken').focus();
+  }
+  // "Sign in with Google" (Google Identity Services): the button hands back an ID token for the
+  // server's OAuth client, which /api/login checks like any other Google ID token.
+  function showGoogleButton(clientId, hd) {
+    const box = $('googleSignIn');
+    box.classList.remove('hidden');
+    $('signinIntro').innerHTML = 'Or run <code>uai web</code> on a machine where <code>uai</code> is set up for this server; it opens this page signed in.';
+    const render = () => {
+      window.google.accounts.id.initialize({
+        client_id: clientId,
+        hd: hd || undefined,
+        ux_mode: 'popup',
+        callback: async (resp) => {
+          $('signinErr').textContent = '';
+          try { await login({ token: resp.credential }); location.reload(); }
+          catch (err) { $('signinErr').textContent = err.message; }
+        },
+      });
+      const dark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+      window.google.accounts.id.renderButton(box, { theme: dark ? 'filled_black' : 'outline', size: 'large', text: 'signin_with', shape: 'pill', width: Math.min(360, box.clientWidth || 360) });
+    };
+    if (window.google && window.google.accounts) { render(); return; }
+    const s = document.createElement('script');
+    s.src = 'https://accounts.google.com/gsi/client';
+    s.async = true;
+    s.onload = render;
+    s.onerror = () => { box.textContent = 'Could not load Google sign-in; paste a token instead.'; };
+    document.head.append(s);
   }
   $('signinForm').addEventListener('submit', async (e) => {
     e.preventDefault();

@@ -283,6 +283,46 @@ pub struct CacheEntry {
     pub path: String,
 }
 
+/// Body of `POST /api/index`: an incremental run, optionally limited to matching packages.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IndexRequest {
+    #[serde(default)]
+    pub only: Option<String>,
+    /// Re-scan unchanged packages too; the API accepts it only together with `only`.
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// The server's latest index run (`GET /api/index`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IndexStatus {
+    /// Goes up by one with every run the server starts; 0 before the first.
+    pub run: u64,
+    pub running: bool,
+    #[serde(default)]
+    pub started_by: Option<String>,
+    #[serde(default)]
+    pub started_at: Option<f64>,
+    #[serde(default)]
+    pub finished_at: Option<f64>,
+    #[serde(default)]
+    pub only: Option<String>,
+    #[serde(default)]
+    pub force: bool,
+    /// Latest progress line (packages done, bytes read, throughput, ETA).
+    #[serde(default)]
+    pub progress: Option<String>,
+    /// Lines the run has logged so far; `log` keeps the most recent of them.
+    #[serde(default)]
+    pub log_total: usize,
+    #[serde(default)]
+    pub log: Vec<String>,
+    #[serde(default)]
+    pub report: Option<IndexReport>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct IndexReport {
     pub found: usize,

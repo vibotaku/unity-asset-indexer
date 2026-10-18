@@ -2,7 +2,7 @@
 name = "uai"
 version = "0.3.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.89"
 description = "Index .unitypackage libraries so individual assets (and their dependencies) can be searched, previewed and extracted without importing whole packages."
 license = "MIT"
 repository = "https://github.com/vibotaku/unity-asset-indexer"

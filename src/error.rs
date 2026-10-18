@@ -19,6 +19,9 @@ pub enum UaiError {
     /// Valid identity, but not on the server's list.
     #[error("{0}")]
     Forbidden(String),
+    /// Something that cannot run twice at once (an index run) is already running.
+    #[error("{0}")]
+    Busy(String),
 }
 
 impl UaiError {
@@ -38,6 +41,7 @@ impl UaiError {
             UaiError::Remote(_) => 502,
             UaiError::Unauthorized(_) => 401,
             UaiError::Forbidden(_) => 403,
+            UaiError::Busy(_) => 423,
         }
     }
 
@@ -63,6 +67,7 @@ impl UaiError {
             400 => UaiError::Invalid(api.error),
             401 => UaiError::Unauthorized(api.error),
             403 => UaiError::Forbidden(api.error),
+            423 => UaiError::Busy(api.error),
             _ => UaiError::Remote(api.error),
         }
     }

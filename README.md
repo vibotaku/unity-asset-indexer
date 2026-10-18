@@ -32,7 +32,7 @@ somewhere on your `PATH`.
 macOS: the binary is not notarized. If Gatekeeper complains the first time, run
 `xattr -d com.apple.quarantine uai` once.
 
-From source: `cargo install --git https://github.com/vibotaku/unity-asset-indexer` (Rust 1.85+).
+From source: `cargo install --git https://github.com/vibotaku/unity-asset-indexer` (Rust 1.89+).
 
 ## Quick start
 
@@ -165,6 +165,17 @@ In a browser the UI asks for a token; `uai web` opens it already signed in (a on
 URL is exchanged for a session cookie that lasts `--session-hours`, 12 by default). Session cookies
 are signed with a key kept in `<home>/session.key`; delete it to sign everyone out.
 
+For a "Sign in with Google" button on that page, create an OAuth client (Google Cloud console →
+Google Auth Platform → Clients → Web application) whose authorized JavaScript origins include the
+server's URL, and pass its id along with the allowed accounts:
+
+```bash
+uai serve --bind 0.0.0.0:7878 --google-domain example.com --google-client-id 1234-abc.apps.googleusercontent.com
+```
+
+Tokens from the button carry that client id as their audience and go through the same checks as any
+Google ID token (signature, expiry, domain/email list); gcloud tokens and pasted tokens keep working.
+
 `uai serve` speaks plain HTTP, so put TLS in front of it (a reverse proxy, a load balancer, Cloud
 Run) before tokens cross a network you do not trust. The session cookie is marked `Secure` when the
 proxy sends `X-Forwarded-Proto: https`. `/healthz` stays open for health checks.
@@ -173,6 +184,15 @@ Thumbnails come from the `preview.png` files inside the packages and are stored 
 `uai index`. An index built by an older version has none yet: run `uai index` again (it re-scans
 packages that lack thumbnails) or leave it, the asset panel can pull a thumbnail on demand. Indexes
 written by the Python prototype (schema v1) are migrated in place on first open.
+
+### Indexing a running server
+
+`uai index` picks up packages added to the library. Against a server it asks the server to index its
+own library (`POST /api/index`, incremental) and follows the run's log; `--no-wait` returns at once
+and `uai index --status` shows the latest run (`GET /api/index`). `--only <package> --force`
+re-scans one package; a full forced re-index has to run on the server itself. Only one index run
+happens at a time (`<home>/index.lock`), so an hourly `uai index` on the server and API calls never
+overlap; the loser gets "another index run is in progress".
 
 ## For agents
 
